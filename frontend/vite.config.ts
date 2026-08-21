@@ -1,5 +1,5 @@
 import path from 'path';
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 
 export default defineConfig({
@@ -14,107 +14,6 @@ export default defineConfig({
         changeOrigin: true,
 		ws: true,
       },
-      // 代理其他后端请求
-      '/cookies': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/account': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/qr-login': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/password-login': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/keywords': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/keywords-with-item-id': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/default-reply': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/items': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/cards': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/automation-rules': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/automation-issues': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/automation-runs': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/automation-pending-tasks': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/notification-channels': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/message-notifications': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/ai-reply-settings': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/ai-models': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/system-settings': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/user-settings': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/admin': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/analytics': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/login': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/verify': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/logout': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
-      '/change-password': {
-        target: 'http://localhost:59188',
-        changeOrigin: true,
-      },
       '/health': {
         target: 'http://localhost:59188',
         changeOrigin: true,
@@ -122,6 +21,29 @@ export default defineConfig({
     },
   },
   plugins: [react()],
+  test: {
+    environment: 'node',
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json-summary', 'html'],
+      reportsDirectory: './coverage',
+      include: ['**/*.{ts,tsx}'],
+      exclude: [
+        '**/*.test.{ts,tsx}',
+        '**/node_modules/**',
+        '**/dist/**',
+        '**/scripts/**',
+        '**/vite.config.ts',
+        // 纯 UI 组件不属于本项目的业务覆盖率目标，交互逻辑应在业务 Hook/状态模块中验证。
+        '**/components/**',
+        'components/**',
+        'App.tsx',
+        'index.tsx',
+        'chatEmojis.tsx',
+        'app/features/dashboard/DashboardTrendChart.tsx',
+      ],
+    },
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, '.'),
@@ -132,8 +54,14 @@ export default defineConfig({
     sourcemap: false,
     rollupOptions: {
       output: {
+        // manualChunks 按依赖领域拆分生产构建文件，控制首屏资源体积。
         manualChunks(id) {
+          // modulePath 是统一分隔符后的模块绝对路径，用于稳定匹配依赖目录。
           const modulePath = id.split(path.sep).join('/');
+          // 聊天元数据包含快捷回复和备注弹窗等低频交互，独立分片可避免挤占会话阅读首屏。
+          if (modulePath.includes('/app/features/chat/components/ChatMetadataFeature.') || modulePath.includes('/app/features/chat/metadata.')) {
+            return 'chat-metadata';
+          }
           if (!modulePath.includes('/node_modules/')) {
             return undefined;
           }
@@ -153,6 +81,10 @@ export default defineConfig({
           }
           if (modulePath.includes('/lucide-react/')) {
             return 'icons-vendor';
+          }
+          // AMR 解码器体积较大，随聊天懒加载路由使用独立块，避免拖慢应用首屏并保持依赖可审计。
+          if (modulePath.includes('/benz-amr-recorder/')) {
+            return 'audio-codec';
           }
           return 'vendor';
         },

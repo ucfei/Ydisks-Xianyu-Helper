@@ -20,37 +20,46 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"xianyu-go/internal/logging"
 	"xianyu-go/internal/logsafe"
 	"xianyu-go/internal/xianyu/mtop"
 	"xianyu-go/internal/xianyu/protocol"
 	"xianyu-go/internal/xianyu/ws"
 )
 
+// main 封装main业务协调。
 func main() {
+	// cookieFile 用于本次流程后续判断的登录凭证文件
 	cookieFile := flag.String("cookie-file", "", "从文件读取 cookie（首行）")
+	// verbose 用于本次流程后续判断的verbose
 	verbose := flag.Bool("v", false, "调试日志")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// logger 保存带集中式脱敏策略的诊断日志实例。
+	logger := logging.NewLogger(os.Stdout, "text")
 	if *verbose {
-		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		// verboseErr 保存切换调试日志等级时的配置错误；固定值 debug 理论上不会失败。
+		if verboseErr := logging.SetLevel("debug"); verboseErr != nil {
+			logger.Error("启用调试日志失败", "err", logsafe.Error(verboseErr))
+		}
 	}
 
+	// cookieStr 用于本次流程后续判断的登录凭证Str
 	cookieStr := strings.TrimSpace(os.Getenv("XIANYU_COOKIE"))
 	if *cookieFile != "" {
+		// b、err 用于本次流程后续判断的b、err
 		b, err := os.ReadFile(*cookieFile)
 		if err != nil {
-			logger.Error("读取 cookie 文件失败", "err", err)
+			logger.Error("读取 cookie 文件失败", "err", logsafe.Error(err))
 			os.Exit(1)
 		}
 		cookieStr = strings.TrimSpace(strings.SplitN(string(b), "\n", 2)[0])
@@ -68,30 +77,35 @@ func main() {
 	}
 	logger.Info("cookie 已加载", "account_hash", logsafe.ID(c["unb"]), "fields", len(c))
 
+	// ctx、cancel 用于本次流程后续判断的ctx、cancel
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	// 1) mtop token API → accessToken。
+	// mc 用于本次流程后续判断的mc
 	mc := mtop.NewClient()
 	logger.Info("步骤 1/3：刷新 token")
+	// res、err 用于本次流程后续判断的res、err
 	res, err := mc.RefreshToken(cookieStr)
 	if err != nil {
-		logger.Error("刷新 token 失败", "err", err)
+		logger.Error("刷新 token 失败", "err", logsafe.Error(err))
 		os.Exit(1)
 	}
 	logger.Info("token 刷新成功", "accessToken_len", len(res.AccessToken))
 
 	// 2) WS 连接 + 注册。
 	deviceID := protocol.GenerateDeviceID(c["unb"])
+	// cfg 用于本次流程后续判断的cfg
 	cfg := ws.Config{
 		CookieStr:   res.UpdatedCookies,
 		DeviceID:    deviceID,
 		AccessToken: res.AccessToken,
 	}
 	logger.Info("步骤 2/3：连接 WebSocket", "device_id", deviceID)
+	// conn、err 用于本次流程后续判断的conn、err
 	conn, err := ws.Dial(ctx, cfg, logger)
 	if err != nil {
-		logger.Error("WS 连接/注册失败", "err", err)
+		logger.Error("WS 连接/注册失败", "err", logsafe.Error(err))
 		os.Exit(1)
 	}
 	defer conn.Close()
@@ -99,24 +113,36 @@ func main() {
 	// 3) 心跳 + 收消息。
 	logger.Info("步骤 3/3：心跳与消息接收（等待闲鱼消息…）")
 	go func() {
-		if err := conn.HeartbeatLoop(ctx, 15*time.Second); err != nil {
-			logger.Error("心跳循环退出", "err", err)
+		if // err 用于本次流程后续判断的err
+		err := conn.HeartbeatLoop(ctx, 15*time.Second); err != nil {
+			logger.Error("心跳循环退出", "err", logsafe.Error(err))
 			cancel()
 		}
 	}()
 
+	// gotMessage 用于本次流程后续判断的got消息
 	gotMessage := false
 	err = conn.ReceiveLoop(ctx, func(decrypted map[string]any) {
 		gotMessage = true
-		b, _ := json.MarshalIndent(decrypted, "", "  ")
-		fmt.Println("\n========== 收到并解密一条消息 ==========")
-		fmt.Println(string(b))
-		fmt.Println("========================================")
-		logger.Info("✅ 成功收到并解密消息，Phase 0 闸门通过")
+		// fieldNames 保存消息顶层字段名；只输出结构摘要，避免把消息正文或凭证带入终端。
+		fieldNames := diagnosticFieldNames(decrypted)
+		logger.Info("✅ 成功收到并解密消息，Phase 0 闸门通过（正文已省略）", "field_count", len(fieldNames), "fields", fieldNames)
 		cancel()
 	})
 	if !gotMessage {
-		logger.Error("未收到消息即退出", "err", err)
+		logger.Error("未收到消息即退出", "err", logsafe.Error(err))
 		os.Exit(1)
 	}
+}
+
+// diagnosticFieldNames 返回消息顶层字段的排序列表，用于安全诊断而不暴露消息值。
+func diagnosticFieldNames(message map[string]any) []string {
+	// fields 保存消息字段名；字段值不会被复制到诊断输出。
+	fields := make([]string, 0, len(message))
+	// fieldName 表示当前消息的顶层字段名。
+	for fieldName := range message {
+		fields = append(fields, fieldName)
+	}
+	sort.Strings(fields)
+	return fields
 }

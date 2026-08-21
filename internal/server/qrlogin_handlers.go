@@ -5,17 +5,15 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	accountapp "xianyu-go/internal/application/account"
 	"xianyu-go/internal/auth"
-	"xianyu-go/internal/db"
-	"xianyu-go/internal/xianyu/cookierefresh"
-	"xianyu-go/internal/xianyu/protocol"
 )
 
+// qrLoginGenerateTimeout 用于本次流程后续判断的qr登录GenerateTimeout
 const qrLoginGenerateTimeout = 2 * time.Minute
 
 // mountQRLoginReal 扫码登录端点（纯 HTTP，不需要浏览器）。
@@ -28,6 +26,7 @@ func (s *Server) mountQRLoginReal(r chi.Router) {
 
 // generateQRLogin 生成扫码登录二维码。
 func (s *Server) generateQRLogin(w http.ResponseWriter, r *http.Request) {
+	// sess 用于本次流程后续判断的sess
 	sess := auth.SessionFromContext(r.Context())
 	if sess == nil {
 		writeErr(w, http.StatusUnauthorized, "未授权访问")
@@ -36,10 +35,19 @@ func (s *Server) generateQRLogin(w http.ResponseWriter, r *http.Request) {
 	s.cleanupQRLoginSessions()
 	// 风控后的闲鱼匿名 token 接口偶尔会明显变慢。二维码生成需要连续完成
 	// token、登录参数和二维码请求，不能沿用前端通用接口的短超时。
+	// generateCtx、cancel 用于本次流程后续判断的generateCtx、cancel
 	generateCtx, cancel := context.WithTimeout(r.Context(), qrLoginGenerateTimeout)
 	defer cancel()
-	sessionID, qrCodeURL, err := s.QRLogin.GenerateQRCode(generateCtx)
+	// qrService 是通过显式平台依赖边界取得的二维码服务；为空时拒绝执行平台调用。
+	qrService := s.qrLoginApplication()
+	if qrService == nil {
+		writeErr(w, http.StatusInternalServerError, "二维码服务未初始化")
+		return
+	}
+	// sessionID、qrCodeURL、err 用于本次流程后续判断的会话ID、qrCodeURL、err
+	sessionID, qrCodeURL, err := qrService.GenerateQRCode(generateCtx)
 	if err != nil {
+		// message 用于本次流程后续判断的消息
 		message := "生成二维码失败: " + err.Error()
 		switch {
 		case errors.Is(err, context.Canceled):
@@ -51,24 +59,29 @@ func (s *Server) generateQRLogin(w http.ResponseWriter, r *http.Request) {
 		default:
 			s.Logger.Error("生成二维码失败", "err", err)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"success": false,
-			"message": message,
-		})
+		writeErrCode(
+			w,
+			http.StatusBadGateway, "qr_login_generate_failed",
+			message, "")
 		return
 	}
-	s.qrMu.Lock()
-	s.qrOwners[sessionID] = qrLoginOwner{UserID: sess.UserID, CreatedAt: time.Now().UTC()}
-	s.qrMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"success":     true,
-		"session_id":  sessionID,
-		"qr_code_url": qrCodeURL,
+	// qrSessions 保存扫码会话所有权；平台二维码服务只负责平台会话本身。
+	accountLogin := s.accountLoginApplication()
+	if accountLogin == nil {
+		writeErr(w, http.StatusInternalServerError, "扫码会话服务未初始化")
+		return
+	}
+	accountLogin.RegisterQRSession(sessionID, sess.UserID, time.Now().UTC())
+	writeJSON(w, http.StatusOK, qrLoginGenerateResponse{
+		Success: true, SessionID: sessionID, QRCodeURL: qrCodeURL,
+		// 生成成功响应只暴露会话标识和二维码地址。
+		// 服务端仍然保留二维码会话所有权校验。
 	})
 }
 
 // checkQRLoginStatus 检查扫码登录状态。
 func (s *Server) checkQRLoginStatus(w http.ResponseWriter, r *http.Request) {
+	// sessionID 用于本次流程后续判断的会话ID
 	sessionID := chi.URLParam(r, "session_id")
 	if sessionID == "" {
 		writeErr(w, http.StatusBadRequest, "缺少 session_id")
@@ -77,12 +90,20 @@ func (s *Server) checkQRLoginStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.requireQRSessionOwner(w, r, sessionID) {
 		return
 	}
-	result := publicQRStatus(s.QRLogin.GetSessionStatus(sessionID))
+	// qrService 是已完成平台依赖校验的二维码服务。
+	qrService := s.qrLoginApplication()
+	if qrService == nil {
+		writeErr(w, http.StatusInternalServerError, "二维码服务未初始化")
+		return
+	}
+	// result 用于本次流程后续判断的结果
+	result := publicQRStatus(qrService.GetSessionStatus(sessionID))
 	writeJSON(w, http.StatusOK, result)
 }
 
 // checkQRLoginStatusAndPersist 兼容上游 /status 语义：扫码成功后由后端幂等保存账号。
 func (s *Server) checkQRLoginStatusAndPersist(w http.ResponseWriter, r *http.Request) {
+	// sessionID 用于本次流程后续判断的会话ID
 	sessionID := chi.URLParam(r, "session_id")
 	if sessionID == "" {
 		writeErr(w, http.StatusBadRequest, "缺少 session_id")
@@ -91,25 +112,34 @@ func (s *Server) checkQRLoginStatusAndPersist(w http.ResponseWriter, r *http.Req
 	if !s.requireQRSessionOwner(w, r, sessionID) {
 		return
 	}
-	result := cloneQRStatus(s.QRLogin.GetSessionStatus(sessionID))
+	// qrService 是已完成平台依赖校验的二维码服务。
+	qrService := s.qrLoginApplication()
+	if qrService == nil {
+		writeErr(w, http.StatusInternalServerError, "二维码服务未初始化")
+		return
+	}
+	// result 用于本次流程后续判断的结果
+	result := cloneQRStatus(qrService.GetSessionStatus(sessionID))
 	if qrStatus(result) != "success" {
 		writeJSON(w, http.StatusOK, publicQRStatus(result))
 		return
 	}
+	// sess 用于本次流程后续判断的sess
 	sess := auth.SessionFromContext(r.Context())
 	if sess == nil {
 		writeErr(w, http.StatusUnauthorized, "未授权访问")
 		return
 	}
-	persisted, err := s.persistQRLoginSuccess(r.Context(), sess.UserID, sessionID, result)
+	// persisted、err 用于本次流程后续判断的persisted、err
+	persisted, err := s.accountLoginApplication().PersistQRLoginSuccess(r.Context(), sess.UserID, sessionID, result, "")
 	if err != nil {
 		if s.Logger != nil {
 			s.Logger.Warn("保存扫码登录结果失败", "session_id", sessionID, "err", err)
 		}
-		result["success"] = false
-		result["status"] = "error"
-		result["message"] = "保存扫码登录结果失败: " + err.Error()
-		writeJSON(w, http.StatusOK, publicQRStatus(result))
+		writeErrCode(
+			w,
+			http.StatusInternalServerError, "qr_login_persist_failed",
+			"保存扫码登录结果失败: "+err.Error(), "")
 		return
 	}
 	result["success"] = true
@@ -120,6 +150,7 @@ func (s *Server) checkQRLoginStatusAndPersist(w http.ResponseWriter, r *http.Req
 
 // completeQRVerification 用户完成风控验证后调用，提取真实 cookie 并入库。
 func (s *Server) completeQRVerification(w http.ResponseWriter, r *http.Request) {
+	// sessionID 用于本次流程后续判断的会话ID
 	sessionID := chi.URLParam(r, "session_id")
 	if sessionID == "" {
 		writeErr(w, http.StatusBadRequest, "缺少 session_id")
@@ -128,222 +159,129 @@ func (s *Server) completeQRVerification(w http.ResponseWriter, r *http.Request) 
 	if !s.requireQRSessionOwner(w, r, sessionID) {
 		return
 	}
-	cookies, unb, err := s.QRLogin.CompleteVerification(r.Context(), sessionID)
-	if err != nil {
-		s.Logger.Error("验证完成处理失败", "err", err)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"success": false,
-			"message": err.Error(),
-		})
+	// qrService 是已完成平台依赖校验的二维码服务。
+	qrService := s.qrLoginApplication()
+	if qrService == nil {
+		writeErr(w, http.StatusInternalServerError, "二维码服务未初始化")
 		return
 	}
-	var req struct {
-		TargetAccountID string `json:"target_account_id"`
+	// cookies、unb、err 用于本次流程后续判断的cookies、unb、err
+	cookies, unb, err := qrService.CompleteVerification(r.Context(), sessionID)
+	if err != nil {
+		s.Logger.Error("验证完成处理失败", "err", err)
+		writeErrCode(
+			w,
+			http.StatusBadGateway, "qr_verification_failed",
+			err.Error(), "")
+		return
 	}
+	// req 保存具名扫码验证完成请求。
+	var req qrVerificationRequestDTO
 	if r.Body != nil && r.ContentLength != 0 {
-		if err := decodeJSON(r, &req); err != nil {
+		if // err 用于本次流程后续判断的err
+		err := decodeJSON(r, &req); err != nil {
 			writeErr(w, http.StatusBadRequest, "请求格式错误")
 			return
 		}
 	}
 	req.TargetAccountID = strings.TrimSpace(req.TargetAccountID)
 	if req.TargetAccountID != "" && req.TargetAccountID != unb {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"success":            false,
-			"scanned_account_id": unb,
-			"message":            "扫码账号与待重新授权账号不一致，已拒绝覆盖；请使用正确账号重新扫码",
-		})
+		writeErrDetails(
+			w, http.StatusConflict,
+			"qr_account_mismatch",
+			"扫码账号与待重新授权账号不一致，已拒绝覆盖；请使用正确账号重新扫码",
+			"", map[string]any{"scanned_account_id": unb})
 		return
 	}
-	resp := map[string]any{
-		"success": true,
-		"unb":     unb,
+	// resp 用于本次流程后续判断的resp
+	resp := qrLoginVerificationResponse{
+		Success: true, UNB: unb,
+		// 验证完成响应保留平台账号标识，兼容旧客户端。
 	}
+	// sess 用于本次流程后续判断的sess
 	sess := auth.SessionFromContext(r.Context())
 	if sess != nil {
+		// result 用于本次流程后续判断的结果
 		result := map[string]any{
 			"status":  "success",
 			"cookies": cookies,
 			"unb":     unb,
 		}
-		if current := s.QRLogin.GetSessionStatus(sessionID); current != nil {
-			if snapshot, ok := current["cookie_snapshot"]; ok {
+		if // current 用于本次流程后续判断的current
+		current := qrService.GetSessionStatus(sessionID); current != nil {
+			if // snapshot、ok 用于本次流程后续判断的snapshot、ok
+			snapshot, ok := current["cookie_snapshot"]; ok {
 				result["cookie_snapshot"] = snapshot
 			}
 		}
-		persisted, persistErr := s.persistQRLoginSuccessFor(r.Context(), sess.UserID, sessionID, result, req.TargetAccountID)
+		// persisted、persistErr 用于本次流程后续判断的persisted、persistErr
+		persisted, persistErr := s.accountLoginApplication().PersistQRLoginSuccess(r.Context(), sess.UserID, sessionID, result, req.TargetAccountID)
 		if persistErr != nil {
 			if s.Logger != nil {
 				s.Logger.Warn("保存扫码验证结果失败", "session_id", sessionID, "err", persistErr)
 			}
-			resp["success"] = false
-			resp["message"] = "保存扫码登录结果失败: " + persistErr.Error()
-			writeJSON(w, http.StatusOK, resp)
+			writeErrCode(
+				w, http.StatusInternalServerError, "qr_login_persist_failed",
+				"保存扫码登录结果失败: "+persistErr.Error(), "")
 			return
 		}
-		resp["account_id"] = persisted.AccountID
-		resp["is_new_account"] = persisted.IsNew
+		resp.AccountID = persisted.AccountID
+		resp.IsNewAccount = persisted.IsNew
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) persistQRLoginSuccess(ctx context.Context, userID int64, sessionID string, result map[string]any) (qrLoginPersistence, error) {
-	return s.persistQRLoginSuccessFor(ctx, userID, sessionID, result, "")
-}
-
-func (s *Server) persistQRLoginSuccessFor(ctx context.Context, userID int64, sessionID string, result map[string]any, targetAccountID string) (qrLoginPersistence, error) {
-	lockValue, _ := s.qrPersistLocks.LoadOrStore(sessionID, &sync.Mutex{})
-	persistMu := lockValue.(*sync.Mutex)
-	persistMu.Lock()
-	defer persistMu.Unlock()
-
-	s.qrMu.Lock()
-	if s.qrPersisted == nil {
-		s.qrPersisted = make(map[string]qrLoginPersistence)
-	}
-	if persisted, ok := s.qrPersisted[sessionID]; ok {
-		s.qrMu.Unlock()
-		if persisted.UserID != userID {
-			return qrLoginPersistence{}, errors.New("扫码会话不属于当前用户")
-		}
-		return persisted, nil
-	}
-	s.qrMu.Unlock()
-	cookies := qrString(result, "cookies")
-	cookieSnapshot, snapshotComplete := qrCookieSnapshot(result)
-	scannedAccountID := strings.TrimSpace(firstNonEmpty(qrString(result, "unb"), protocol.TransCookies(cookies)["unb"]))
-	if cookies == "" || scannedAccountID == "" {
-		return qrLoginPersistence{}, errors.New("扫码结果缺少 cookies 或 unb")
-	}
-	accountID := strings.TrimSpace(targetAccountID)
-	if accountID == "" {
-		accountID = scannedAccountID
-	} else if accountID != scannedAccountID {
-		return qrLoginPersistence{}, errors.New("扫码账号与待重新授权账号不一致，已拒绝覆盖")
-	}
-
-	isNew := false
-	credentialUnlock := s.Store.LockAccountCredentials(accountID)
-	saveErr := func() error {
-		defer credentialUnlock()
-		detail, err := s.Store.Cookies.GetDetails(ctx, accountID)
-		switch {
-		case errors.Is(err, db.ErrNotFound):
-			if targetAccountID != "" {
-				return errors.New("待重新授权账号不存在")
-			}
-			isNew = true
-			if err := s.Store.Cookies.CreateOwned(ctx, accountID, cookies, userID); err != nil {
-				return err
-			}
-			if snapshotComplete {
-				metadata := cookierefresh.MetadataWithSnapshot("", cookieSnapshot)
-				if err := s.Store.Cookies.UpdateRenewalCookie(ctx, accountID, cookies, metadata, time.Now().Unix()); err != nil {
-					return err
-				}
-			}
-		case err != nil:
-			return err
-		case detail == nil:
-			return db.ErrNotFound
-		case detail.UserID != userID:
-			if targetAccountID != "" {
-				return errors.New("待重新授权账号不属于当前用户")
-			}
-			return db.ErrForbidden
-		default:
-			if snapshotComplete {
-				metadata := cookierefresh.MetadataWithSnapshot(detail.MetadataJSON, cookieSnapshot)
-				if err := s.Store.Cookies.UpdateRenewalCookie(ctx, detail.ID, cookies, metadata, time.Now().Unix()); err != nil {
-					return err
-				}
-			} else if err := s.updateFlatCookieOwnedLocked(ctx, detail, cookies); err != nil {
-				return err
-			}
-		}
-		s.markSuccessfulLogin(ctx, accountID, userID, loginMethodQRScan, "扫码登录成功")
-		if s.Store.Tokens != nil {
-			if err := s.Store.Tokens.Clear(ctx, accountID); err != nil {
-				s.Logger.Warn("扫码登录保存后清理旧连接凭证失败", "cookie_id", accountID, "err", err)
-			}
-		}
-		return nil
-	}()
-	if saveErr != nil {
-		if errors.Is(saveErr, db.ErrForbidden) {
-			return qrLoginPersistence{}, errors.New("该账号ID已存在且不属于当前用户")
-		}
-		if errors.Is(saveErr, db.ErrAlreadyExists) {
-			return qrLoginPersistence{}, errors.New("该账号ID已被并发创建，请重新获取账号状态")
-		}
-		return qrLoginPersistence{}, saveErr
-	}
-	if d, err := s.Store.Cookies.GetDetails(ctx, accountID); err == nil {
-		s.refreshAccountProfile(ctx, d)
-	}
-	s.wakeCredentialBlockedAutomation(ctx, accountID)
-	if s.Manager != nil && s.Store.Cookies.GetStatus(ctx, accountID) {
-		if err := s.Manager.Restart(ctx, accountID); err != nil && s.Logger != nil {
-			s.Logger.Warn("扫码登录后重启账号失败", "cookie_id", accountID, "err", err)
-		}
-	}
-	persisted := qrLoginPersistence{AccountID: accountID, IsNew: isNew, UserID: userID, CreatedAt: time.Now().UTC()}
-	s.qrMu.Lock()
-	s.qrPersisted[sessionID] = persisted
-	s.qrMu.Unlock()
-	s.qrPersistLocks.Delete(sessionID)
-	return persisted, nil
-}
-
+// requireQRSessionOwner 封装requireQR会话所有者业务协调。
 func (s *Server) requireQRSessionOwner(w http.ResponseWriter, r *http.Request, sessionID string) bool {
+	// sess 用于本次流程后续判断的sess
 	sess := auth.SessionFromContext(r.Context())
 	if sess == nil {
 		writeErr(w, http.StatusUnauthorized, "未授权访问")
 		return false
 	}
-	s.qrMu.Lock()
-	owner, ok := s.qrOwners[sessionID]
-	expired := ok && owner.CreatedAt.Before(time.Now().UTC().Add(-30*time.Minute))
-	if expired {
-		delete(s.qrOwners, sessionID)
-		delete(s.qrPersisted, sessionID)
-		s.qrPersistLocks.Delete(sessionID)
+	// qrSessions 负责所有权、过期判断和幂等状态清理，HTTP 层不再持有可变会话表。
+	accountLogin := s.accountLoginApplication()
+	if accountLogin == nil {
+		writeErr(w, http.StatusInternalServerError, "扫码会话服务未初始化")
+		return false
 	}
-	s.qrMu.Unlock()
-	if expired {
-		if cleaner, cleanable := s.QRLogin.(interface{ DeleteSession(string) }); cleanable {
-			cleaner.DeleteSession(sessionID)
+	// err 保存扫码会话所有权校验结果。
+	if err := accountLogin.AuthorizeQRSession(sessionID, sess.UserID); err != nil {
+		if errors.Is(err, accountapp.ErrQRLoginSessionNotFound) {
+			// cleaner、cleanable 分别表示平台会话清理器及其接口是否可用。
+			if qrService := s.qrLoginApplication(); qrService != nil {
+				qrService.DeleteSession(sessionID)
+			}
 		}
-	}
-	if !ok || expired || owner.UserID != sess.UserID {
 		writeErr(w, http.StatusNotFound, "扫码会话不存在或已过期")
 		return false
 	}
 	return true
 }
 
+// cleanupQRLoginSessions 封装cleanupQR登录Sessions业务协调。
 func (s *Server) cleanupQRLoginSessions() {
-	cutoff := time.Now().UTC().Add(-30 * time.Minute)
-	expired := make([]string, 0)
-	s.qrMu.Lock()
-	for id, owner := range s.qrOwners {
-		if owner.CreatedAt.Before(cutoff) {
-			delete(s.qrOwners, id)
-			delete(s.qrPersisted, id)
-			s.qrPersistLocks.Delete(id)
-			expired = append(expired, id)
-		}
+	// qrSessions 提供应用层扫码会话过期清理能力。
+	accountLogin := s.accountLoginApplication()
+	if accountLogin == nil {
+		return
 	}
-	s.qrMu.Unlock()
-	if cleaner, ok := s.QRLogin.(interface{ DeleteSession(string) }); ok {
+	// expired 保存应用层报告的过期扫码会话标识。
+	expired := accountLogin.CleanupQRSessions(time.Now().UTC())
+	// cleaner 是可选二维码平台会话清理 Port，仅用于释放已确认过期的远端会话。
+	if cleaner := s.qrLoginApplication(); cleaner != nil {
+		// id 表示当前遍历过程中的标识
 		for _, id := range expired {
 			cleaner.DeleteSession(id)
 		}
 	}
 }
 
+// cloneQRStatus 封装cloneQR状态业务协调。
 func cloneQRStatus(src map[string]any) map[string]any {
+	// dst 用于本次流程后续判断的dst
 	dst := make(map[string]any, len(src))
+	// k、v 表示当前遍历过程中的k、v
 	for k, v := range src {
 		dst[k] = v
 	}
@@ -352,35 +290,44 @@ func cloneQRStatus(src map[string]any) map[string]any {
 
 // publicQRStatus 返回可暴露给浏览器的扫码状态。闲鱼 Cookie 只在服务端持久化，
 // 永远不进入前端、浏览器日志或代理响应。
-func publicQRStatus(src map[string]any) map[string]any {
-	dst := cloneQRStatus(src)
-	delete(dst, "cookies")
-	delete(dst, "cookie_snapshot")
-	return dst
-}
-
-func qrStatus(result map[string]any) string {
-	status, _ := result["status"].(string)
+// publicQRStatus 封装publicQR状态业务协调。
+func publicQRStatus(src map[string]any) qrLoginStatusResponse {
+	// status 保存允许传输到浏览器的扫码状态；Cookie 和快照字段刻意不映射。
+	status := qrLoginStatusResponse{Status: qrStatus(src)}
+	// success 表示上游是否报告扫码流程成功；ok 表示字段类型确实为布尔值。
+	if success, ok := src["success"].(bool); ok {
+		status.Success = success
+	}
+	// message 保存上游返回的用户提示文本；ok 表示字段类型确实为字符串。
+	if message, ok := src["message"].(string); ok {
+		status.Message = message
+	}
+	// verificationScreenshot 保存风控页面截图兜底地址；ok 表示字段类型确实为字符串。
+	if verificationScreenshot, ok := src["verification_screenshot"].(string); ok {
+		status.VerificationScreenshot = verificationScreenshot
+	}
+	// faceQRURL 保存人脸风控二维码地址；ok 表示字段类型确实为字符串。
+	if faceQRURL, ok := src["face_qr_url"].(string); ok {
+		status.FaceQRURL = faceQRURL
+	}
+	// sessionID 保存扫码会话标识；ok 表示字段类型确实为字符串。
+	if sessionID, ok := src["session_id"].(string); ok {
+		status.SessionID = sessionID
+	}
+	// accountID 保存扫码成功后关联的本地账号标识；ok 表示字段类型确实为字符串。
+	if accountID, ok := src["account_id"].(string); ok {
+		status.AccountID = accountID
+	}
+	// isNew 表示是否新建本地账号；ok 表示字段类型确实为布尔值。
+	if isNew, ok := src["is_new_account"].(bool); ok {
+		status.IsNewAccount = isNew
+	}
 	return status
 }
 
-func qrString(result map[string]any, key string) string {
-	value, _ := result[key].(string)
-	return strings.TrimSpace(value)
-}
-
-func qrCookieSnapshot(result map[string]any) ([]cookierefresh.BrowserCookie, bool) {
-	raw, ok := result["cookie_snapshot"]
-	if !ok {
-		return nil, false
-	}
-	snapshot, ok := raw.([]cookierefresh.BrowserCookie)
-	if !ok || snapshot == nil {
-		return nil, false
-	}
-	normalized := cookierefresh.NormalizeSnapshot(snapshot)
-	if normalized == nil {
-		normalized = []cookierefresh.BrowserCookie{}
-	}
-	return normalized, true
+// qrStatus 封装qr状态业务协调。
+func qrStatus(result map[string]any) string {
+	// status 用于本次流程后续判断的状态
+	status, _ := result["status"].(string)
+	return status
 }

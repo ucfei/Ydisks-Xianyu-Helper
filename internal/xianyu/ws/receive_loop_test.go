@@ -17,9 +17,12 @@ import (
 
 // startWSEchoServer 启动一个本地 WS 服务：升级后发送一条同步推送消息，再读取并忽略 ACK，
 // 最后关闭连接。返回服务 URL。用于驱动 ReceiveLoop 的消息分发测试。
+// startWSEchoServer 封装开始WSEchoServer业务协调。
 func startWSEchoServer(t *testing.T, payload string) *httptest.Server {
 	t.Helper()
+	// srv 用于本次流程后续判断的srv
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// c、err 用于本次流程后续判断的c、err
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -27,6 +30,7 @@ func startWSEchoServer(t *testing.T, payload string) *httptest.Server {
 		defer c.Close(websocket.StatusNormalClosure, "")
 		// 构造同步推送帧：body.syncPushPackage.data[0].data = base64(payload)。
 		b64 := base64.StdEncoding.EncodeToString([]byte(payload))
+		// frame 用于本次流程后续判断的frame
 		frame := map[string]any{
 			"lwp":     "/s/sync",
 			"headers": map[string]any{"mid": "m1", "sid": "s1"},
@@ -34,8 +38,10 @@ func startWSEchoServer(t *testing.T, payload string) *httptest.Server {
 				"data": []any{map[string]any{"data": b64}},
 			}},
 		}
+		// raw 用于本次流程后续判断的原始
 		raw, _ := json.Marshal(frame)
-		if err := c.Write(r.Context(), websocket.MessageText, raw); err != nil {
+		if // err 用于本次流程后续判断的err
+		err := c.Write(r.Context(), websocket.MessageText, raw); err != nil {
 			return
 		}
 		// 读掉 ACK 后关闭（触发客户端 Read 返回错误，结束 ReceiveLoop）。
@@ -54,12 +60,17 @@ func wsURL(srv *httptest.Server) string {
 
 // TestReceiveLoop_DecodesSyncPayload 验证 ReceiveLoop 收到同步推送帧后：
 // 解码 base64+JSON → 调用 onMessage → 回 ACK（服务端能读到）→ 连接关闭后退出。
+// TestReceiveLoop_DecodesSyncPayload 封装TestReceiveLoopDecodesSync请求载荷业务协调。
 func TestReceiveLoop_DecodesSyncPayload(t *testing.T) {
+	// payload 用于本次流程后续判断的请求载荷
 	payload := `{"event":"paid","order_id":"o1"}`
+	// srv 用于本次流程后续判断的srv
 	srv := startWSEchoServer(t, payload)
 
+	// dialCtx、dialCancel 用于本次流程后续判断的dialCtx、dial取消
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer dialCancel()
+	// dialed、err 用于本次流程后续判断的dialed、err
 	dialed, _, err := websocket.Dial(dialCtx, wsURL(srv), nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -67,10 +78,14 @@ func TestReceiveLoop_DecodesSyncPayload(t *testing.T) {
 	defer dialed.CloseNow()
 	dialed.SetReadLimit(8 << 20)
 
+	// conn 用于本次流程后续判断的conn
 	conn := newConn(dialed, Config{}, nilLogger())
 
+	// got 用于本次流程后续判断的got
 	var got map[string]any
+	// loopDone 用于本次流程后续判断的loopDone
 	loopDone := make(chan error, 1)
+	// ctx、cancel 用于本次流程后续判断的ctx、cancel
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	go func() {
@@ -91,7 +106,9 @@ func TestReceiveLoop_DecodesSyncPayload(t *testing.T) {
 
 // TestReceiveLoop_NonJSONSkipped 非 JSON 消息应被跳过，不回调 onMessage，循环继续。
 func TestReceiveLoop_NonJSONSkipped(t *testing.T) {
+	// srv 用于本次流程后续判断的srv
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// c、err 用于本次流程后续判断的c、err
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -99,22 +116,28 @@ func TestReceiveLoop_NonJSONSkipped(t *testing.T) {
 		defer c.Close(websocket.StatusNormalClosure, "")
 		// 先发一条非 JSON，再发一条合法同步推送。
 		c.Write(r.Context(), websocket.MessageText, []byte("not-json"))
+		// b64 用于本次流程后续判断的b64
 		b64 := base64.StdEncoding.EncodeToString([]byte(`{"ok":true}`))
+		// frame 用于本次流程后续判断的frame
 		frame := map[string]any{
 			"lwp":     "/s/sync",
 			"headers": map[string]any{"mid": "m2"},
 			"body":    map[string]any{"syncPushPackage": map[string]any{"data": []any{map[string]any{"data": b64}}}},
 		}
+		// raw 用于本次流程后续判断的原始
 		raw, _ := json.Marshal(frame)
 		c.Write(r.Context(), websocket.MessageText, raw)
+		// ctx、cancel 用于本次流程后续判断的ctx、cancel
 		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
 		defer cancel()
 		_, _, _ = c.Read(ctx) // ACK
 	}))
 	defer srv.Close()
 
+	// dialCtx、dialCancel 用于本次流程后续判断的dialCtx、dial取消
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer dialCancel()
+	// dialed、err 用于本次流程后续判断的dialed、err
 	dialed, _, err := websocket.Dial(dialCtx, wsURL(srv), nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -122,9 +145,13 @@ func TestReceiveLoop_NonJSONSkipped(t *testing.T) {
 	defer dialed.CloseNow()
 	dialed.SetReadLimit(8 << 20)
 
+	// conn 用于本次流程后续判断的conn
 	conn := newConn(dialed, Config{}, nilLogger())
+	// got 用于本次流程后续判断的got
 	var got map[string]any
+	// loopDone 用于本次流程后续判断的loopDone
 	loopDone := make(chan error, 1)
+	// ctx、cancel 用于本次流程后续判断的ctx、cancel
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	go func() {
@@ -138,7 +165,9 @@ func TestReceiveLoop_NonJSONSkipped(t *testing.T) {
 
 // TestHeartbeatLoop_ContextCancel HeartbeatLoop 应在 ctx 取消时及时退出。
 func TestHeartbeatLoop_ContextCancel(t *testing.T) {
+	// srv 用于本次流程后续判断的srv
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// c、err 用于本次流程后续判断的c、err
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -148,15 +177,18 @@ func TestHeartbeatLoop_ContextCancel(t *testing.T) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 		for {
-			if _, _, err := c.Read(ctx); err != nil {
+			if // err 用于本次流程后续判断的err
+			_, _, err := c.Read(ctx); err != nil {
 				return
 			}
 		}
 	}))
 	defer srv.Close()
 
+	// dialCtx、dialCancel 用于本次流程后续判断的dialCtx、dial取消
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer dialCancel()
+	// dialed、err 用于本次流程后续判断的dialed、err
 	dialed, _, err := websocket.Dial(dialCtx, wsURL(srv), nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -164,8 +196,11 @@ func TestHeartbeatLoop_ContextCancel(t *testing.T) {
 	defer dialed.CloseNow()
 	dialed.SetReadLimit(8 << 20)
 
+	// conn 用于本次流程后续判断的conn
 	conn := newConn(dialed, Config{}, nilLogger())
+	// ctx、cancel 用于本次流程后续判断的ctx、cancel
 	ctx, cancel := context.WithCancel(context.Background())
+	// loopDone 用于本次流程后续判断的loopDone
 	loopDone := make(chan error, 1)
 	go func() {
 		loopDone <- conn.HeartbeatLoop(ctx, 50*time.Millisecond)
@@ -174,7 +209,8 @@ func TestHeartbeatLoop_ContextCancel(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 	select {
-	case err := <-loopDone:
+	case // err 用于本次流程后续判断的err
+	err := <-loopDone:
 		if err != nil && err != context.Canceled {
 			t.Fatalf("HeartbeatLoop 退出 err=%v", err)
 		}

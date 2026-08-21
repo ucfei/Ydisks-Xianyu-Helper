@@ -1,10 +1,12 @@
 package server
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
+	adminapp "xianyu-go/internal/application/admin"
 )
 
 // mountAdminReal 管理员端点。
@@ -15,137 +17,85 @@ func (s *Server) mountAdminReal(r chi.Router) {
 	r.Get("/admin/stats", s.adminStats)
 }
 
+// adminListUsers 封装adminList用户列表业务协调。
 func (s *Server) adminListUsers(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.Store.DB.QueryContext(r.Context(),
-		`SELECT id, username, email, is_active, is_admin, created_at FROM users ORDER BY id`)
+	// rows、err 用于本次流程后续判断的rows、err
+	rows, err := s.applicationServiceSet().admin.ListUsers(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "查询失败")
 		return
 	}
-	defer rows.Close()
-	var out []map[string]any
-	for rows.Next() {
-		var id int64
-		var username, email, createdAt string
-		var isActive, isAdmin int
-		if err := rows.Scan(&id, &username, &email, &isActive, &isAdmin, &createdAt); err != nil {
-			writeErr(w, http.StatusInternalServerError, "读取用户数据失败")
-			return
-		}
-		// 统计每个用户的账号数。
-		var cookieCount int
-		if err := s.Store.DB.QueryRowContext(r.Context(),
-			`SELECT COUNT(*) FROM cookies WHERE user_id=?`, id).Scan(&cookieCount); err != nil {
-			writeErr(w, http.StatusInternalServerError, "统计用户账号失败")
-			return
-		}
-		out = append(out, map[string]any{
-			"id": id, "username": username, "email": email,
-			"is_active": isActive != 0, "is_admin": isAdmin != 0,
-			"created_at": createdAt, "cookie_count": cookieCount,
+	// out 用于本次流程后续判断的out
+	var out []adminUserResponse
+	// row 表示当前遍历过程中的row
+	for _, row := range rows {
+		out = append(out, adminUserResponse{
+			ID: row.ID, Username: row.Username, Email: row.Email,
+			IsActive: row.IsActive, IsAdmin: row.IsAdmin,
+			CreatedAt: row.CreatedAt, CookieCount: row.CookieCount,
 		})
-	}
-	if err := rows.Err(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "读取用户数据失败")
-		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
+// adminDeleteUser 封装adminDelete用户业务协调。
 func (s *Server) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
+	// uid、err 用于本次流程后续判断的uid、err
 	uid, err := strconv.ParseInt(chi.URLParam(r, "user_id"), 10, 64)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "无效用户ID")
 		return
 	}
-	// 不允许删除自己。
+	// 不允许删除自己；应用服务统一执行该业务规则。
 	sess := authSess(r)
-	if sess.UserID == uid {
-		writeErr(w, http.StatusBadRequest, "不能删除当前登录用户")
-		return
-	}
-	if s.Manager != nil {
-		if accounts, listErr := s.Store.Cookies.AllForUser(r.Context(), uid); listErr == nil {
-			for cookieID := range accounts {
-				s.Manager.Stop(cookieID)
-			}
+	// err 保存管理员删除应用用例的执行结果。
+	if err := s.applicationServiceSet().admin.DeleteUser(r.Context(), sess.UserID, uid); err != nil {
+		if errors.Is(err, adminapp.ErrSelfDelete) {
+			writeErr(w, http.StatusBadRequest, "不能删除当前登录用户")
+			return
 		}
-	}
-	if err := s.Store.Users.Delete(r.Context(), uid); err != nil {
 		writeErr(w, http.StatusInternalServerError, "删除失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	writeJSON(w, http.StatusOK, operationResponse{Success: true})
 }
 
+// adminListCookies 封装adminListCookies业务协调。
 func (s *Server) adminListCookies(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.Store.DB.QueryContext(r.Context(),
-		`SELECT c.id, c.user_id, COALESCE(c.remark,''), c.created_at, u.username
-		 FROM cookies c LEFT JOIN users u ON c.user_id=u.id ORDER BY c.created_at DESC`)
+	// rows、err 保存应用服务返回的管理员账号摘要及查询错误。
+	rows, err := s.accountSummaryApplication().ListAdminSummaries(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "查询失败")
 		return
 	}
-	defer rows.Close()
-	var out []map[string]any
-	for rows.Next() {
-		var id string
-		var uid int64
-		var remark, createdAt, username string
-		if err := rows.Scan(&id, &uid, &remark, &createdAt, &username); err != nil {
-			writeErr(w, http.StatusInternalServerError, "读取账号数据失败")
-			return
-		}
-		out = append(out, map[string]any{
-			"id": id, "user_id": uid, "remark": remark,
-			"created_at": createdAt, "owner": username,
-			"enabled": s.Store.Cookies.GetStatus(r.Context(), id),
+	// out 用于本次流程后续判断的out
+	var out []adminCookieResponse
+	// row 表示当前遍历过程中的row
+	for _, row := range rows {
+		out = append(out, adminCookieResponse{
+			ID: row.ID, UserID: row.UserID, Remark: row.Remark,
+			CreatedAt: row.CreatedAt, Owner: row.Owner,
+			Enabled: row.Enabled,
 		})
-	}
-	if err := rows.Err(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "读取账号数据失败")
-		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
+// adminStats 封装adminStats业务协调。
 func (s *Server) adminStats(w http.ResponseWriter, r *http.Request) {
-	// 字段名与前端 AdminStats 接口对齐：
-	// total_users / total_cookies / active_cookies / total_cards / total_keywords / total_orders
-	var totalUsers, totalCookies, totalCards, totalOrders, totalKeywords int64
-	counts := []struct {
-		query string
-		dest  *int64
-	}{
-		{`SELECT COUNT(*) FROM users`, &totalUsers},
-		{`SELECT COUNT(*) FROM cookies`, &totalCookies},
-		{`SELECT COUNT(*) FROM cards`, &totalCards},
-		{`SELECT COUNT(*) FROM orders WHERE deleted_at IS NULL`, &totalOrders},
-		{`SELECT COUNT(*) FROM keywords`, &totalKeywords},
-	}
-	for _, count := range counts {
-		if err := s.Store.DB.QueryRowContext(r.Context(), count.query).Scan(count.dest); err != nil {
-			writeErr(w, http.StatusInternalServerError, "统计数据失败")
-			return
-		}
-	}
-
-	// 活跃账号：cookie_status.enabled=1 的数量（无记录默认启用，故统计 enabled=1 或无记录的）。
-	var activeCookies int64
-	if err := s.Store.DB.QueryRowContext(r.Context(), `
-		SELECT COUNT(*) FROM cookies c
-		WHERE NOT EXISTS (SELECT 1 FROM cookie_status cs WHERE cs.cookie_id=c.id AND cs.enabled=0)
-	`).Scan(&activeCookies); err != nil {
-		writeErr(w, http.StatusInternalServerError, "统计活跃账号失败")
+	// stats 是管理员仪表盘的数据库聚合结果。
+	stats, err := s.applicationServiceSet().admin.Stats(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "统计数据失败")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]int64{
-		"total_users":    totalUsers,
-		"total_cookies":  totalCookies,
-		"active_cookies": activeCookies,
-		"total_cards":    totalCards,
-		"total_keywords": totalKeywords,
-		"total_orders":   totalOrders,
+	writeJSON(w, http.StatusOK, adminStatsResponse{
+		TotalUsers: stats.TotalUsers, TotalCookies: stats.TotalCookies, ActiveCookies: stats.ActiveCookies,
+		TotalCards: stats.TotalCards, TotalKeywords: stats.TotalKeywords, TotalOrders: stats.TotalOrders,
+		// 统计响应继续保留原有字段名称，兼容管理员仪表盘。
+		// DTO 字段由具名结构统一维护，避免动态 map 漏字段。
+		// 所有统计值均来自当前数据库快照。
+		// 成功响应不再依赖任意键名拼接。
 	})
 }

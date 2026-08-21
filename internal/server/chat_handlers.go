@@ -2,8 +2,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,12 +15,24 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/go-chi/chi/v5"
 
+	chatapp "xianyu-go/internal/application/chat"
 	"xianyu-go/internal/auth"
-	"xianyu-go/internal/db"
-	"xianyu-go/internal/engine"
-	"xianyu-go/internal/xianyu/mtop"
 )
 
+// markChatReadRequest 是提交聊天已读状态的 HTTP 请求 DTO。
+type markChatReadRequest struct {
+	// AccountID 是当前用户有权操作的账号标识。
+	AccountID string `json:"account_id"`
+	// ChatID 是会话标识。
+	ChatID string `json:"chat_id"`
+	// MessageIDs 是平台已读接口需要的消息标识集合。
+	MessageIDs []map[string]any `json:"message_ids"`
+}
+
+// platformReadReportTimeout 限制平台已读回执的独立远端等待时间，浏览器断开不应取消该尽力上报。
+const platformReadReportTimeout = 5 * time.Second
+
+// mountChat 封装mount聊天业务协调。
 func (s *Server) mountChat(r chi.Router) {
 	r.Get("/api/chat/sessions", s.listChatSessions)
 	r.Get("/api/chat/messages", s.listChatMessages)
@@ -31,124 +42,84 @@ func (s *Server) mountChat(r chi.Router) {
 	r.Get("/api/chat/ws", s.chatWebSocket)
 }
 
+// chatApplication 返回当前 Server 绑定的聊天历史应用服务。
+func (s *Server) chatApplication() ChatPort {
+	return s.applicationServiceSet().chat
+}
+
+// listChatSessions 封装list聊天Sessions业务协调。
 func (s *Server) listChatSessions(w http.ResponseWriter, r *http.Request) {
+	// sess 用于本次流程后续判断的sess
 	sess := auth.SessionFromContext(r.Context())
+	// accountID 用于本次流程后续判断的账号ID
 	accountID := strings.TrimSpace(r.URL.Query().Get("account_id"))
 	if !s.ownsAccount(r, accountID) {
 		writeErr(w, http.StatusForbidden, "无权访问该账号")
 		return
 	}
+	// cursor 用于本次流程后续判断的游标
 	cursor, _ := strconv.ParseInt(r.URL.Query().Get("cursor"), 10, 64)
+	// refresh 用于本次流程后续判断的refresh
 	refresh := r.URL.Query().Get("refresh") == "1"
+	// hasMore 用于本次流程后续判断的hasMore
 	var hasMore bool
+	// nextCursor 用于本次流程后续判断的next游标
 	var nextCursor int64
-	if err := s.Store.Chats.DeleteEmptySessions(r.Context(), accountID); err != nil {
+	if // err 保存清理空会话的错误。
+	err := s.chatApplication().CleanupEmptySessions(r.Context(), accountID); err != nil {
 		writeErr(w, http.StatusInternalServerError, "清理无效聊天会话失败")
 		return
 	}
-	if refresh && s.chat != nil && s.Manager != nil {
-		if sender, ok := s.Manager.GetInstance(accountID); ok {
-			if fetcher, ok := sender.(interface {
-				FetchChatConversations(context.Context, int64, int) (map[string]any, string, error)
-			}); ok {
-				fetchCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-				body, myID, fetchErr := fetcher.FetchChatConversations(fetchCtx, cursor, 100)
-				cancel()
-				if fetchErr == nil {
-					page, saveErr := s.chat.RecordConversationPage(r.Context(), accountID, myID, body)
-					if saveErr != nil {
-						writeErr(w, http.StatusInternalServerError, "保存历史联系人失败")
-						return
-					}
-					hasMore, nextCursor = page.HasMore, page.NextCursor
-				} else {
-					s.recoverExpiredMTOPSession(r.Context(), accountID, fetchErr)
-				}
-			}
+	if refresh {
+		// fetchCtx 和 cancel 限制平台联系人刷新请求的最长时间。
+		fetchCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		// page 和 fetchErr 保存应用层联系人分页结果及平台/持久化错误。
+		page, fetchErr := s.chatApplication().RefreshConversations(fetchCtx, accountID, cursor, 100)
+		cancel()
+		if fetchErr == nil {
+			hasMore, nextCursor = page.HasMore, page.NextCursor
+		} else if errors.Is(fetchErr, chatapp.ErrRefreshPersist) {
+			writeErr(w, http.StatusInternalServerError, "保存历史联系人失败")
+			return
+		} else if !errors.Is(fetchErr, chatapp.ErrRefreshUnavailable) && !errors.Is(fetchErr, chatapp.ErrOffline) {
+			s.recoverExpiredSession(r.Context(), accountID, fetchErr)
 		}
 	}
-	rows, err := s.Store.Chats.ListSessions(r.Context(), sess.UserID, accountID, parsePositiveInt(r.URL.Query().Get("limit"), 200))
+	// rows、err 保存应用层会话摘要及查询错误。
+	rows, err := s.chatApplication().ListSessions(r.Context(), sess.UserID, accountID, parsePositiveInt(r.URL.Query().Get("limit"), 200))
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "读取聊天会话失败")
 		return
 	}
 	if refresh {
-		if cookieValue, cookieErr := s.Store.Cookies.GetValue(r.Context(), accountID); cookieErr == nil {
-			client, canResolve := s.mtopClient().(interface {
-				FetchChatUserInfo(context.Context, string, string) (*mtop.ChatUserInfo, error)
-			})
-			if !canResolve {
-				writeJSON(w, http.StatusOK, map[string]any{"sessions": rows, "has_more": hasMore, "next_cursor": nextCursor})
-				return
-			}
-			resolveCtx, resolveCancel := context.WithTimeout(r.Context(), 25*time.Second)
-			defer resolveCancel()
-			jobs := make(chan int)
-			var workers sync.WaitGroup
-			var sessionOnce sync.Once
-			var sessionErr error
-			for worker := 0; worker < 8; worker++ {
-				workers.Add(1)
-				go func() {
-					defer workers.Done()
-					for index := range jobs {
-						infoCtx, cancel := context.WithTimeout(resolveCtx, 3*time.Second)
-						info, infoErr := client.FetchChatUserInfo(infoCtx, cookieValue, rows[index].ChatID)
-						cancel()
-						if mtop.IsSessionExpiredErr(infoErr) {
-							sessionOnce.Do(func() {
-								sessionErr = infoErr
-								resolveCancel()
-							})
-							continue
-						}
-						if infoErr != nil || info == nil {
-							continue
-						}
-						if nickname := strings.TrimSpace(info.Nickname); nickname != "" {
-							rows[index].BuyerName = nickname
-						}
-						if info.AvatarURL != "" {
-							rows[index].BuyerAvatar = info.AvatarURL
-						}
-						_ = s.Store.Chats.UpdateSessionIdentity(resolveCtx, accountID, rows[index].ChatID,
-							rows[index].BuyerID, rows[index].BuyerName, rows[index].BuyerAvatar)
-					}
-				}()
-			}
-		queue:
-			for index := range rows {
-				if rows[index].BuyerID == "1400" {
-					continue
-				}
-				select {
-				case jobs <- index:
-				case <-resolveCtx.Done():
-					break queue
-				}
-			}
-			close(jobs)
-			workers.Wait()
-			if sessionErr != nil {
-				s.recoverExpiredMTOPSession(r.Context(), accountID, sessionErr)
-			}
+		// resolveCtx 和 resolveCancel 限制联系人身份补全的总时长。
+		resolveCtx, resolveCancel := context.WithTimeout(r.Context(), 25*time.Second)
+		// refreshedRows 和 sessionErr 保存应用层身份补全结果及首个平台错误。
+		refreshedRows, sessionErr := s.chatApplication().RefreshSessionIdentities(resolveCtx, accountID, rows)
+		resolveCancel()
+		rows = refreshedRows
+		if sessionErr != nil {
+			s.recoverExpiredSession(r.Context(), accountID, sessionErr)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sessions": rows, "has_more": hasMore, "next_cursor": nextCursor})
+	writeJSON(w, http.StatusOK, chatSessionPageResponse{Sessions: newChatSessionDTOsFromApplication(rows), HasMore: hasMore, NextCursor: nextCursor})
 }
 
+// sendChatImage 封装send聊天图片业务协调。
 func (s *Server) sendChatImage(w http.ResponseWriter, r *http.Request) {
-	if s.chat == nil || s.Manager == nil {
+	if !s.chatApplication().ImageUploadAvailable() {
 		writeErr(w, http.StatusServiceUnavailable, "聊天服务未启用")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		writeErr(w, http.StatusBadRequest, "图片不能为空且不能超过 10MB")
+	// 单张图片上限仍为 10 MiB，总请求额外保留 multipart 元数据空间，避免恰好 10 MiB 的合法图片被包装开销拒绝。
+	if !parseMultipartRequest(w, r, maxChatImageMultipartBytes, maxChatImageMultipartBytes, "图片上传内容不能超过 11 MiB") {
 		return
 	}
+	// accountID 用于本次流程后续判断的账号ID
 	accountID := strings.TrimSpace(r.FormValue("account_id"))
+	// chatID 用于本次流程后续判断的聊天ID
 	chatID := strings.TrimSpace(r.FormValue("chat_id"))
+	// buyerID 用于本次流程后续判断的买家ID
 	buyerID := strings.TrimSpace(r.FormValue("buyer_id"))
 	if !s.ownsAccount(r, accountID) {
 		writeErr(w, http.StatusForbidden, "无权操作该账号")
@@ -158,72 +129,55 @@ func (s *Server) sendChatImage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "会话和买家不能为空")
 		return
 	}
+	// file、header、err 用于本次流程后续判断的file、header、err
 	file, header, err := r.FormFile("image")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "请选择图片")
 		return
 	}
 	defer file.Close()
+	// contentType 用于本次流程后续判断的内容类型
 	contentType := header.Header.Get("Content-Type")
 	if !strings.HasPrefix(strings.ToLower(contentType), "image/") {
 		writeErr(w, http.StatusBadRequest, "只支持图片文件")
 		return
 	}
-	data, err := io.ReadAll(io.LimitReader(file, (10<<20)+1))
-	if err != nil || len(data) == 0 || len(data) > 10<<20 {
+	// data、err 用于本次流程后续判断的data、err
+	data, err := io.ReadAll(io.LimitReader(file, maxChatImageBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxChatImageBytes {
 		writeErr(w, http.StatusBadRequest, "图片不能为空且不能超过 10MB")
 		return
 	}
-	sender, ok := s.Manager.GetInstance(accountID)
-	if !ok || sender == nil {
-		writeErr(w, http.StatusConflict, "账号当前离线，无法发送图片")
-		return
-	}
-	cookies, err := s.Store.Cookies.GetValue(r.Context(), accountID)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "读取账号凭证失败")
-		return
-	}
-	uploader, ok := s.mtopClient().(interface {
-		UploadChatImage(context.Context, string, string, string, []byte) (*mtop.ChatImageUpload, error)
-	})
-	if !ok {
-		writeErr(w, http.StatusServiceUnavailable, "图片上传服务未启用")
-		return
-	}
-	upload, err := uploader.UploadChatImage(r.Context(), cookies, header.Filename, contentType, data)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "图片上传到闲鱼失败: "+err.Error())
-		return
-	}
-	if upload.UpdatedCookies != "" && upload.UpdatedCookies != cookies {
-		_ = s.Store.Cookies.UpdateValueExisting(r.Context(), accountID, upload.UpdatedCookies)
-		sender.UpdateCookie(upload.UpdatedCookies)
-	}
-	session := db.ChatSession{CookieID: accountID, ChatID: chatID, BuyerID: buyerID,
+	// session 保存已完成账号归属校验的应用层会话摘要。
+	session := chatapp.Session{AccountID: accountID, ChatID: chatID, BuyerID: buyerID,
 		BuyerName: r.FormValue("buyer_name"), BuyerAvatar: r.FormValue("buyer_avatar_url"),
 		ItemID: r.FormValue("item_id"), ItemTitle: r.FormValue("item_title")}
-	message, err := s.chat.CreateOutgoingMedia(r.Context(), session, "image", upload.URL)
+	// sent、err 用于本次流程后续判断的sent、err
+	sent, err := s.chatApplication().SendImage(r.Context(), chatapp.ImageInput{Session: session, Filename: header.Filename, ContentType: contentType, Data: data})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存待发送图片失败")
+		if errors.Is(err, chatapp.ErrUnavailable) {
+			writeErr(w, http.StatusServiceUnavailable, "图片上传服务未启用")
+		} else if errors.Is(err, chatapp.ErrOffline) {
+			writeErr(w, http.StatusConflict, "账号当前离线，无法发送图片")
+		} else if errors.Is(err, chatapp.ErrSend) {
+			writeErrDetails(w, http.StatusBadGateway, "chat_image_send_failed", "图片发送失败，请重试", "", map[string]any{"outgoing_message": sent})
+		} else if errors.Is(err, chatapp.ErrStatusSave) {
+			writeErr(w, http.StatusInternalServerError, "图片已发送，但状态保存失败")
+		} else {
+			writeErr(w, http.StatusInternalServerError, "保存待发送图片失败")
+		}
 		return
 	}
-	if err := sender.SendImage(engine.WithOutgoingMessageKey(r.Context(), message.MessageKey), chatID, buyerID, upload.URL, 0); err != nil {
-		failed, _ := s.chat.SetOutgoingStatus(context.Background(), accountID, message.MessageKey, "failed")
-		writeJSON(w, http.StatusBadGateway, map[string]any{"message": failed, "error": "图片发送失败，请重试"})
-		return
-	}
-	sent, err := s.chat.SetOutgoingStatus(r.Context(), accountID, message.MessageKey, "sent")
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "图片已发送，但状态保存失败")
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{"message": sent})
+	writeJSON(w, http.StatusCreated, chatMessageEnvelope{Message: newChatMessageDTOFromApplication(sent)})
 }
 
+// listChatMessages 封装list聊天消息列表业务协调。
 func (s *Server) listChatMessages(w http.ResponseWriter, r *http.Request) {
+	// sess 用于本次流程后续判断的sess
 	sess := auth.SessionFromContext(r.Context())
+	// accountID 用于本次流程后续判断的账号ID
 	accountID := strings.TrimSpace(r.URL.Query().Get("account_id"))
+	// chatID 用于本次流程后续判断的聊天ID
 	chatID := strings.TrimSpace(r.URL.Query().Get("chat_id"))
 	if !s.ownsAccount(r, accountID) {
 		writeErr(w, http.StatusForbidden, "无权访问该账号")
@@ -233,82 +187,55 @@ func (s *Server) listChatMessages(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "缺少 chat_id")
 		return
 	}
+	// beforeID 用于本次流程后续判断的beforeID
 	beforeID, _ := strconv.ParseInt(r.URL.Query().Get("before_id"), 10, 64)
+	// cursor 用于本次流程后续判断的游标
 	cursor, _ := strconv.ParseInt(r.URL.Query().Get("cursor"), 10, 64)
+	// limit 用于本次流程后续判断的上限
 	limit := parsePositiveInt(r.URL.Query().Get("limit"), 50)
-	if s.chat != nil && s.Manager != nil {
-		if sender, ok := s.Manager.GetInstance(accountID); ok {
-			if fetcher, ok := sender.(interface {
-				FetchChatHistory(context.Context, string, int64, int) (map[string]any, string, error)
-			}); ok {
-				fetchCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-				body, myID, fetchErr := fetcher.FetchChatHistory(fetchCtx, chatID, cursor, limit)
-				cancel()
-				if fetchErr == nil {
-					sessions, _ := s.Store.Chats.ListSessions(r.Context(), sess.UserID, accountID, 500)
-					var current db.ChatSession
-					for _, candidate := range sessions {
-						if candidate.ChatID == chatID {
-							current = candidate
-							break
-						}
-					}
-					page, saveErr := s.chat.RecordHistoryPage(r.Context(), accountID, chatID, myID, current, body)
-					if saveErr != nil {
-						writeErr(w, http.StatusInternalServerError, "保存聊天历史失败")
-						return
-					}
-					current = s.resolveSelectedChatIdentity(r.Context(), accountID, current)
-					writeJSON(w, http.StatusOK, map[string]any{"messages": page.Messages, "has_more": page.HasMore, "next_cursor": page.NextCursor, "session": current})
-					return
-				}
-			}
+	// current 保存刷新前的本地会话摘要，供平台历史写入和响应展示使用。
+	current, _ := s.chatApplication().FindSession(r.Context(), sess.UserID, accountID, chatID)
+	// fetchCtx 和 cancel 限制平台历史刷新请求的最长时间。
+	fetchCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	// refreshed 和 fetchErr 保存应用层消息分页结果及平台/持久化错误。
+	refreshed, fetchErr := s.chatApplication().RefreshHistory(fetchCtx, accountID, chatID, cursor, limit, current)
+	cancel()
+	if fetchErr == nil {
+		// resolved 和 identityErr 保存身份补全后的会话及平台查询错误。
+		resolved, identityErr := s.chatApplication().ResolveSessionIdentity(r.Context(), refreshed.Session)
+		if identityErr != nil {
+			s.recoverExpiredSession(r.Context(), accountID, identityErr)
 		}
+		writeJSON(w, http.StatusOK, chatMessagePageResponse{Messages: newChatMessageDTOsFromApplication(refreshed.Messages), HasMore: refreshed.HasMore, NextCursor: refreshed.NextCursor, Session: newChatSessionDTOFromApplication(resolved)})
+		return
 	}
-	rows, err := s.Store.Chats.ListMessages(r.Context(), sess.UserID, accountID, chatID, beforeID,
-		limit)
+	if errors.Is(fetchErr, chatapp.ErrRefreshPersist) {
+		writeErr(w, http.StatusInternalServerError, "保存聊天历史失败")
+		return
+	}
+	if !errors.Is(fetchErr, chatapp.ErrRefreshUnavailable) && !errors.Is(fetchErr, chatapp.ErrOffline) {
+		s.recoverExpiredSession(r.Context(), accountID, fetchErr)
+	}
+	// page、err 用于本次流程后续判断的page、err
+	page, err := s.chatApplication().ListStoredMessages(r.Context(), sess.UserID, accountID, chatID, beforeID, limit)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "读取聊天消息失败")
 		return
 	}
-	var current db.ChatSession
-	if sessions, sessionErr := s.Store.Chats.ListSessions(r.Context(), sess.UserID, accountID, 500); sessionErr == nil {
-		for _, candidate := range sessions {
-			if candidate.ChatID == chatID {
-				current = s.resolveSelectedChatIdentity(r.Context(), accountID, candidate)
-				break
-			}
+	// session 是应用层返回的非敏感会话摘要，供平台身份适配器补齐展示名称。
+	session := page.Session
+	if session.ChatID != "" {
+		// resolved 和 identityErr 保存身份补全后的会话及平台查询错误。
+		resolved, identityErr := s.chatApplication().ResolveSessionIdentity(r.Context(), session)
+		if identityErr != nil {
+			s.recoverExpiredSession(r.Context(), accountID, identityErr)
 		}
+		session = resolved
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"messages": rows, "has_more": len(rows) == limit, "session": current})
+	writeJSON(w, http.StatusOK, chatMessagePageResponse{Messages: newChatMessageDTOsFromApplication(page.Messages), HasMore: page.HasMore, Session: newChatSessionDTOFromApplication(session)})
 }
 
-func (s *Server) resolveSelectedChatIdentity(ctx context.Context, accountID string, session db.ChatSession) db.ChatSession {
-	if session.BuyerID != "1400" {
-		cookies, cookieErr := s.Store.Cookies.GetValue(ctx, accountID)
-		client, supported := s.mtopClient().(interface {
-			FetchChatUserInfo(context.Context, string, string) (*mtop.ChatUserInfo, error)
-		})
-		if cookieErr == nil && supported {
-			resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			info, err := client.FetchChatUserInfo(resolveCtx, cookies, session.ChatID)
-			cancel()
-			if err == nil && info != nil {
-				if nickname := strings.TrimSpace(info.Nickname); nickname != "" {
-					session.BuyerName = nickname
-				}
-				if info.AvatarURL != "" {
-					session.BuyerAvatar = info.AvatarURL
-				}
-			} else if err != nil {
-				s.recoverExpiredMTOPSession(ctx, accountID, err)
-			}
-		}
-	}
-	_ = s.Store.Chats.UpdateSessionIdentity(ctx, accountID, session.ChatID, session.BuyerID, session.BuyerName, session.BuyerAvatar)
-	return session
-}
-
+// sendChatMessageRequest 用于本次流程后续判断的send聊天消息请求
 type sendChatMessageRequest struct {
 	AccountID string `json:"account_id"`
 	ChatID    string `json:"chat_id"`
@@ -319,13 +246,16 @@ type sendChatMessageRequest struct {
 	Text      string `json:"text"`
 }
 
+// sendChatMessage 封装send聊天消息业务协调。
 func (s *Server) sendChatMessage(w http.ResponseWriter, r *http.Request) {
-	if s.chat == nil || s.Manager == nil {
+	if !s.chatApplication().SendingAvailable() {
 		writeErr(w, http.StatusServiceUnavailable, "聊天服务未启用")
 		return
 	}
+	// input 用于本次流程后续判断的input
 	var input sendChatMessageRequest
-	if err := decodeJSON(r, &input); err != nil {
+	if // err 用于本次流程后续判断的err
+	err := decodeJSON(r, &input); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
@@ -343,37 +273,29 @@ func (s *Server) sendChatMessage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "消息不能超过 2000 个字符")
 		return
 	}
-	sender, ok := s.Manager.GetInstance(input.AccountID)
-	if !ok || sender == nil {
-		writeErr(w, http.StatusConflict, "账号当前离线，无法发送消息")
-		return
-	}
-	message, err := s.chat.CreateOutgoing(r.Context(), db.ChatSession{CookieID: input.AccountID, ChatID: input.ChatID,
-		BuyerID: input.BuyerID, BuyerName: input.BuyerName, ItemID: input.ItemID, ItemTitle: input.ItemTitle}, input.Text)
+	// sent、err 保存应用层发送结果及错误；应用层返回的消息不含凭证。
+	sent, err := s.chatApplication().SendText(r.Context(), chatapp.OutgoingInput{Session: chatapp.Session{AccountID: input.AccountID, ChatID: input.ChatID, BuyerID: input.BuyerID, BuyerName: input.BuyerName, ItemID: input.ItemID, ItemTitle: input.ItemTitle}, Text: input.Text})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存待发送消息失败")
+		if errors.Is(err, chatapp.ErrUnavailable) {
+			writeErr(w, http.StatusServiceUnavailable, "聊天服务未启用")
+		} else if errors.Is(err, chatapp.ErrOffline) {
+			writeErr(w, http.StatusConflict, "账号当前离线，无法发送消息")
+		} else if errors.Is(err, chatapp.ErrSend) {
+			writeErrDetails(w, http.StatusBadGateway, "chat_message_send_failed", "发送失败，请重试", "", map[string]any{"outgoing_message": sent})
+		} else if errors.Is(err, chatapp.ErrStatusSave) {
+			writeErr(w, http.StatusInternalServerError, "消息已发送，但状态保存失败")
+		} else {
+			writeErr(w, http.StatusInternalServerError, "保存待发送消息失败")
+		}
 		return
 	}
-	sendContext := engine.WithOutgoingMessageKey(r.Context(), message.MessageKey)
-	if err := sender.SendText(sendContext, input.ChatID, input.BuyerID, input.Text); err != nil {
-		failed, _ := s.chat.SetOutgoingStatus(context.Background(), input.AccountID, message.MessageKey, "failed")
-		writeJSON(w, http.StatusBadGateway, map[string]any{"message": failed, "error": "发送失败，请重试"})
-		return
-	}
-	sent, err := s.chat.SetOutgoingStatus(r.Context(), input.AccountID, message.MessageKey, "sent")
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "消息已发送，但状态保存失败")
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{"message": sent})
+	writeJSON(w, http.StatusCreated, chatMessageEnvelope{Message: newChatMessageDTOFromApplication(sent)})
 }
 
+// markChatRead 封装mark聊天Read业务协调。
 func (s *Server) markChatRead(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		AccountID  string           `json:"account_id"`
-		ChatID     string           `json:"chat_id"`
-		MessageIDs []map[string]any `json:"message_ids"`
-	}
+	// input 是聊天已读请求的具名传输 DTO。
+	var input markChatReadRequest
 	if decodeJSON(r, &input) != nil || input.ChatID == "" {
 		writeErr(w, http.StatusBadRequest, "请求格式错误")
 		return
@@ -382,14 +304,17 @@ func (s *Server) markChatRead(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "无权操作该账号")
 		return
 	}
-	slog.Info("收到聊天已读请求", "account", input.AccountID, "chat_id", input.ChatID, "message_count", len(input.MessageIDs))
+	// sess 保存当前认证用户，用于本地未读状态归属隔离。
+	sess := auth.SessionFromContext(r.Context())
+	slog.Debug("收到聊天已读请求", "account", input.AccountID, "chat_id", input.ChatID, "message_count", len(input.MessageIDs))
 	if len(input.MessageIDs) == 0 {
-		// 兼容只传会话 ID 的调用方：从本地最近消息补齐平台消息 ID。
-		userID := auth.SessionFromContext(r.Context()).UserID
-		if rows, err := s.Store.Chats.ListMessages(r.Context(), userID, input.AccountID, input.ChatID, 0, 200); err == nil {
-			for _, row := range rows {
-				if row.Direction == "incoming" && row.MessageType != "system" {
-					input.MessageIDs = append(input.MessageIDs, map[string]any{"messageId": row.MessageKey})
+		// page 保存应用层返回的本地消息页，只含非敏感字段。
+		page, listErr := s.chatApplication().ListStoredMessages(r.Context(), sess.UserID, input.AccountID, input.ChatID, 0, 200)
+		if listErr == nil {
+			// message 是当前用于补全平台已读消息标识的入站消息。
+			for _, message := range page.Messages {
+				if message.Direction == "incoming" && message.MessageType != "system" {
+					input.MessageIDs = append(input.MessageIDs, map[string]any{"messageId": message.MessageKey})
 				}
 			}
 		}
@@ -399,50 +324,52 @@ func (s *Server) markChatRead(w http.ResponseWriter, r *http.Request) {
 	// PNM ID；这里从已保存的解密 WS 诊断帧把旧 ID 转回 PNM，避免升级后
 	// 仍有历史实时消息无法被标记已读。
 	input.MessageIDs = s.resolveChatReadMessageIDs(r.Context(), input.AccountID, input.ChatID, input.MessageIDs)
-	sess := auth.SessionFromContext(r.Context())
-	if err := s.Store.Chats.MarkRead(r.Context(), sess.UserID, input.AccountID, input.ChatID); err != nil {
+	if // err 保存应用层已读状态更新错误。
+	err := s.chatApplication().MarkRead(r.Context(), sess.UserID, input.AccountID, input.ChatID); err != nil {
 		writeErr(w, http.StatusInternalServerError, "更新已读状态失败")
 		return
 	}
-	if s.Manager != nil {
-		if sender, ok := s.Manager.GetInstance(input.AccountID); ok {
-			if reader, ok := sender.(interface {
-				MarkChatRead(context.Context, string, []map[string]any) error
-			}); ok {
-				if err := reader.MarkChatRead(r.Context(), input.ChatID, input.MessageIDs); err != nil {
-					slog.Warn("上报闲鱼已读状态失败", "account", input.AccountID, "chat_id", input.ChatID, "err", err)
-				}
-			}
+	// reportCtx 和 reportCancel 为尽力上报提供独立的有界生命周期：本地已读提交成功后，浏览器中止请求不应取消平台回执。
+	reportCtx, reportCancel := context.WithTimeout(context.Background(), platformReadReportTimeout)
+	defer reportCancel()
+	// reportErr 表示平台已读上报失败；本地已读状态已成功保存，不能回滚。
+	if reportErr := s.chatApplication().ReportPlatformRead(reportCtx, input.AccountID, input.ChatID, input.MessageIDs); reportErr != nil {
+		if errors.Is(reportErr, context.Canceled) {
+			slog.Debug("上报闲鱼已读状态已取消", "account", input.AccountID, "chat_id", input.ChatID)
+		} else {
+			slog.Warn("上报闲鱼已读状态失败", "account", input.AccountID, "chat_id", input.ChatID, "err", reportErr)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	writeJSON(w, http.StatusOK, operationResponse{Success: true})
 }
 
+// resolveChatReadMessageIDs 将旧版关联标识交给应用服务解析，并移除无效或重复的已读项。
 func (s *Server) resolveChatReadMessageIDs(ctx context.Context, accountID, chatID string, messageIDs []map[string]any) []map[string]any {
-	if s == nil || s.Store == nil || s.Store.DB == nil {
-		return messageIDs
-	}
+	// resolved 保存可安全提交给平台的去重消息标识列表。
 	resolved := make([]map[string]any, 0, len(messageIDs))
+	// seen 保存已加入结果的平台 PNM 标识，避免重复上报。
 	seen := make(map[string]struct{}, len(messageIDs))
+	// item 是当前待转换的已读消息参数。
 	for _, item := range messageIDs {
-		id := strings.TrimSpace(fmt.Sprint(item["messageId"]))
-		if id == "" || id == "<nil>" {
+		// rawID 保存请求携带的原始消息标识。
+		rawID, ok := item["messageId"].(string)
+		if !ok || strings.TrimSpace(rawID) == "" {
 			continue
 		}
+		// id 保存应用层解析后的平台消息标识。
+		id := s.chatApplication().ResolveReadMessageID(ctx, accountID, chatID, rawID)
 		if !strings.HasSuffix(id, ".PNM") {
-			if platformID := s.lookupChatPlatformMessageID(ctx, accountID, chatID, id); platformID != "" {
-				slog.Info("已将旧聊天消息 ID 转换为平台 PNM", "account", accountID, "chat_id", chatID, "old_message_id", id, "message_id", platformID)
-				id = platformID
-			} else {
-				slog.Warn("未找到旧聊天消息对应的 PNM，跳过已读上报", "account", accountID, "chat_id", chatID, "message_id", id)
-				continue
-			}
+			slog.Debug("未找到旧聊天消息对应的 PNM，跳过已读上报", "account", accountID, "chat_id", chatID, "message_id", rawID)
+			continue
 		}
-		if _, ok := seen[id]; ok {
+		// exists 表示该平台消息标识是否已经加入本次上报请求。
+		if _, exists := seen[id]; exists {
 			continue
 		}
 		seen[id] = struct{}{}
+		// copyItem 保存保留其他平台参数、只替换消息标识的请求副本。
 		copyItem := make(map[string]any, len(item)+1)
+		// key、value 保存当前平台参数名及其原始值。
 		for key, value := range item {
 			copyItem[key] = value
 		}
@@ -452,149 +379,91 @@ func (s *Server) resolveChatReadMessageIDs(ctx context.Context, accountID, chatI
 	return resolved
 }
 
-func (s *Server) lookupChatPlatformMessageID(ctx context.Context, accountID, chatID, legacyID string) string {
-	rows, err := s.Store.DB.QueryContext(ctx, `SELECT parsed_json FROM ws_messages
-		WHERE cookie_id=? AND direction='in' AND parse_status='decrypted' AND parsed_json LIKE ?
-		ORDER BY id DESC LIMIT 20`, accountID, "%"+legacyID+"%")
-	if err != nil {
-		return ""
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var raw string
-		if rows.Scan(&raw) != nil {
-			continue
-		}
-		var decoded any
-		if json.Unmarshal([]byte(raw), &decoded) != nil {
-			continue
-		}
-		if platformID := findChatPlatformMessageID(decoded, chatID, legacyID); platformID != "" {
-			return platformID
-		}
-	}
-	return ""
-}
-
+// findChatPlatformMessageID 保留既有包内测试入口，实际解析由聊天应用服务拥有。
 func findChatPlatformMessageID(value any, chatID, legacyID string) string {
-	var walk func(any) string
-	walk = func(current any) string {
-		switch typed := current.(type) {
-		case map[string]any:
-			if m10, ok := typed["10"]; ok && chatReadValueContainsID(m10, legacyID) {
-				if candidate := strings.TrimSpace(fmt.Sprint(typed["3"])); strings.HasSuffix(candidate, ".PNM") {
-					if cid := strings.TrimSuffix(strings.TrimSpace(fmt.Sprint(typed["2"])), "@goofish"); cid == "" || cid == chatID {
-						return candidate
-					}
-				}
-			}
-			for _, child := range typed {
-				if candidate := walk(child); candidate != "" {
-					return candidate
-				}
-			}
-		case []any:
-			for _, child := range typed {
-				if candidate := walk(child); candidate != "" {
-					return candidate
-				}
-			}
-		case string:
-			var nested any
-			if json.Unmarshal([]byte(typed), &nested) == nil {
-				return walk(nested)
-			}
-		}
-		return ""
-	}
-	return walk(value)
+	return chatapp.FindPlatformMessageID(value, chatID, legacyID)
 }
 
-func chatReadValueContainsID(value any, legacyID string) bool {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, child := range typed {
-			if strings.EqualFold(key, "messageId") || strings.EqualFold(key, "message_id") {
-				if strings.TrimSpace(fmt.Sprint(child)) == legacyID {
-					return true
-				}
-			}
-			if chatReadValueContainsID(child, legacyID) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range typed {
-			if chatReadValueContainsID(child, legacyID) {
-				return true
-			}
-		}
-	case string:
-		var nested any
-		if json.Unmarshal([]byte(typed), &nested) == nil {
-			return chatReadValueContainsID(nested, legacyID)
-		}
-	}
-	return false
-}
-
+// chatWebSocket 将应用层聊天事件转发到当前认证用户的 WebSocket 连接。
 func (s *Server) chatWebSocket(w http.ResponseWriter, r *http.Request) {
-	if s.chat == nil {
-		writeErr(w, http.StatusServiceUnavailable, "聊天服务未启用")
-		return
-	}
+	// sess 用于本次流程后续判断的sess
 	sess := auth.SessionFromContext(r.Context())
-	events, unsubscribe, err := s.chat.Subscribe(r.Context(), sess.UserID)
+	// events、unsubscribe、err 保存应用层实时事件、清理函数和订阅错误。
+	events, unsubscribe, err := s.chatApplication().Subscribe(r.Context(), sess.UserID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "订阅聊天消息失败")
+		if errors.Is(err, chatapp.ErrSubscriptionUnavailable) {
+			writeErr(w, http.StatusServiceUnavailable, "聊天服务未启用")
+		} else {
+			writeErr(w, http.StatusInternalServerError, "订阅聊天消息失败")
+		}
 		return
 	}
-	defer unsubscribe()
+	// conn、err 用于本次流程后续判断的conn、err
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionContextTakeover})
 	if err != nil {
+		unsubscribe()
 		return
 	}
-	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "") }()
+	// ctx、cancel 用于本次流程后续判断的ctx、cancel
 	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
 	conn.SetReadLimit(8 << 10)
+	// readerWG 等待读取 goroutine 在连接关闭后退出，避免请求返回时遗留后台任务。
+	var readerWG sync.WaitGroup
+	readerWG.Add(1)
 	go func() {
+		defer readerWG.Done()
 		for {
-			if _, _, readErr := conn.Read(ctx); readErr != nil {
+			if // readErr 用于本次流程后续判断的readErr
+			_, _, readErr := conn.Read(ctx); readErr != nil {
 				cancel()
 				return
 			}
 		}
 	}()
-	if err := wsjson.Write(ctx, conn, map[string]any{"type": "ready", "at": time.Now().UTC().UnixMilli()}); err != nil {
+	// cleanup 统一负责取消请求、关闭 WebSocket、等待读取任务和释放聊天订阅。
+	cleanup := func() {
+		cancel()
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+		readerWG.Wait()
+		unsubscribe()
+	}
+	defer cleanup()
+	if // err 用于本次流程后续判断的err
+	err := wsjson.Write(ctx, conn, map[string]any{"type": "ready", "at": time.Now().UTC().UnixMilli()}); err != nil {
 		return
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case event, ok := <-events:
-			if !ok || wsjson.Write(ctx, conn, event) != nil {
+		case // event、ok 用于本次流程后续判断的event、ok
+		event, ok := <-events:
+			if !ok || wsjson.Write(ctx, conn, newChatEventDTOFromApplication(event)) != nil {
 				return
 			}
 		}
 	}
 }
 
+// ownsAccount 封装owns账号业务协调。
 func (s *Server) ownsAccount(r *http.Request, accountID string) bool {
 	if accountID == "" {
 		return false
 	}
+	// sess 用于本次流程后续判断的sess
 	sess := auth.SessionFromContext(r.Context())
-	accounts, err := s.Store.Cookies.AllForUser(r.Context(), sess.UserID)
-	if err != nil {
-		return false
-	}
-	_, ok := accounts[accountID]
-	return ok
+	// owned 和 err 表示聊天应用端口返回的账号归属及查询错误。
+	owned, err := s.chatApplication().OwnsAccount(r.Context(), sess.UserID, accountID)
+	return err == nil && owned
 }
 
+/*
+账号查询已采用所有权窄接口。
+*/
+// parsePositiveInt 将正整数文本转换为整数，无法解析时返回备用值。
+// parsePositiveInt 封装parsePositiveInt业务协调。
 func parsePositiveInt(raw string, fallback int) int {
+	// value、err 用于本次流程后续判断的value、err
 	value, err := strconv.Atoi(raw)
 	if err != nil || value <= 0 {
 		return fallback

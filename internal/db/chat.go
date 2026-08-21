@@ -9,19 +9,23 @@ import (
 	"time"
 )
 
+// ChatSession 用于本次流程后续判断的聊天会话
 type ChatSession struct {
-	CookieID      string `json:"account_id"`
-	ChatID        string `json:"chat_id"`
-	BuyerID       string `json:"buyer_id"`
-	BuyerName     string `json:"buyer_name"`
-	BuyerAvatar   string `json:"buyer_avatar_url"`
-	ItemID        string `json:"item_id"`
-	ItemTitle     string `json:"item_title"`
+	CookieID    string `json:"account_id"`
+	ChatID      string `json:"chat_id"`
+	BuyerID     string `json:"buyer_id"`
+	BuyerName   string `json:"buyer_name"`
+	BuyerAvatar string `json:"buyer_avatar_url"`
+	ItemID      string `json:"item_id"`
+	ItemTitle   string `json:"item_title"`
+	// ItemImageURL 是会话商品主图的公开地址，仅用于聊天列表展示。
+	ItemImageURL  string `json:"item_image_url"`
 	LastMessage   string `json:"last_message"`
 	LastMessageAt int64  `json:"last_message_at"`
 	UnreadCount   int    `json:"unread_count"`
 }
 
+// ChatMessage 用于本次流程后续判断的聊天消息
 type ChatMessage struct {
 	ID          int64  `json:"id"`
 	CookieID    string `json:"account_id"`
@@ -32,45 +36,57 @@ type ChatMessage struct {
 	SenderName  string `json:"sender_name"`
 	MessageType string `json:"message_type"`
 	Content     string `json:"content"`
-	Status      string `json:"status"`
-	ReadStatus  int    `json:"read_status"`
-	ReadAt      int64  `json:"read_at,omitempty"`
-	SentAt      int64  `json:"sent_at"`
+	// MediaDuration 是平台语音消息提供的秒级时长，非语音或缺失时为零。
+	MediaDuration int64  `json:"media_duration"`
+	Status        string `json:"status"`
+	ReadStatus    int    `json:"read_status"`
+	ReadAt        int64  `json:"read_at,omitempty"`
+	SentAt        int64  `json:"sent_at"`
 }
 
+// ChatStore 用于本次流程后续判断的聊天Store
 type ChatStore struct {
 	DB      *sql.DB
 	Dialect Dialect
 }
 
+// UpsertSession 封装Upsert会话业务协调。
 func (s *ChatStore) UpsertSession(ctx context.Context, session ChatSession) error {
+	// now 用于本次流程后续判断的now
 	now := time.Now().UTC().Unix()
+	// prefix 用于本次流程后续判断的prefix
 	prefix := dialectInsertIgnorePrefix(s.Dialect)
+	// query 用于本次流程后续判断的查询
 	query := prefix + ` INTO chat_sessions
-		(cookie_id,chat_id,buyer_id,buyer_name,buyer_avatar_url,item_id,item_title,last_message,last_message_at,unread_count,created_at,updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)` + dialectInsertIgnore(s.Dialect, []string{"cookie_id", "chat_id"})
-	if _, err := s.DB.ExecContext(ctx, query, session.CookieID, session.ChatID, session.BuyerID, session.BuyerName,
-		session.BuyerAvatar, session.ItemID, session.ItemTitle, session.LastMessage, session.LastMessageAt,
+		(cookie_id,chat_id,buyer_id,buyer_name,buyer_avatar_url,item_id,item_title,item_image_url,last_message,last_message_at,unread_count,created_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)` + dialectInsertIgnore(s.Dialect, []string{"cookie_id", "chat_id"})
+	if // err 用于本次流程后续判断的err
+	_, err := s.DB.ExecContext(ctx, query, session.CookieID, session.ChatID, session.BuyerID, session.BuyerName,
+		session.BuyerAvatar, session.ItemID, session.ItemTitle, session.ItemImageURL, session.LastMessage, session.LastMessageAt,
 		session.UnreadCount, now, now); err != nil {
 		return err
 	}
+	// err 用于本次流程后续判断的err
 	_, err := s.DB.ExecContext(ctx, `UPDATE chat_sessions SET
 		buyer_id=CASE WHEN ?<>'' THEN ? ELSE buyer_id END,
 		buyer_name=CASE WHEN ?<>'' THEN ? ELSE buyer_name END,
 		buyer_avatar_url=CASE WHEN ?<>'' THEN ? ELSE buyer_avatar_url END,
 		item_id=CASE WHEN ?<>'' THEN ? ELSE item_id END,
 		item_title=CASE WHEN ?<>'' THEN ? ELSE item_title END,
+		item_image_url=CASE WHEN ?<>'' THEN ? ELSE item_image_url END,
 		last_message=CASE WHEN last_message_at<=? THEN ? ELSE last_message END,
 		last_message_at=CASE WHEN last_message_at<=? THEN ? ELSE last_message_at END,
 		unread_count=CASE WHEN ?>unread_count THEN ? ELSE unread_count END,updated_at=?
 		WHERE cookie_id=? AND chat_id=?`, session.BuyerID, session.BuyerID, session.BuyerName, session.BuyerName,
-		session.BuyerAvatar, session.BuyerAvatar, session.ItemID, session.ItemID, session.ItemTitle, session.ItemTitle,
+		session.BuyerAvatar, session.BuyerAvatar, session.ItemID, session.ItemID, session.ItemTitle, session.ItemTitle, session.ItemImageURL, session.ItemImageURL,
 		session.LastMessageAt, session.LastMessage, session.LastMessageAt, session.LastMessageAt,
 		session.UnreadCount, session.UnreadCount, now, session.CookieID, session.ChatID)
 	return err
 }
 
+// DeleteSession 删除会话。
 func (s *ChatStore) DeleteSession(ctx context.Context, cookieID, chatID string) error {
+	// err 用于本次流程后续判断的err
 	_, err := s.DB.ExecContext(ctx, `DELETE FROM chat_sessions WHERE cookie_id=? AND chat_id=?`, cookieID, chatID)
 	return err
 }
@@ -78,7 +94,9 @@ func (s *ChatStore) DeleteSession(ctx context.Context, cookieID, chatID string) 
 // DeleteEmptySessions removes conversation shells returned by IM pagination
 // with visible=0 and no lastMessage. Older versions persisted these shells as
 // "暂无消息", although the official UI never renders them.
+// DeleteEmptySessions 删除EmptySessions。
 func (s *ChatStore) DeleteEmptySessions(ctx context.Context, cookieID string) error {
+	// err 用于本次流程后续判断的err
 	_, err := s.DB.ExecContext(ctx, `DELETE FROM chat_sessions
 		WHERE cookie_id=? AND (last_message='' OR last_message='暂无消息')
 		AND NOT EXISTS (SELECT 1 FROM chat_messages m WHERE m.cookie_id=chat_sessions.cookie_id AND m.chat_id=chat_sessions.chat_id)`, cookieID)
@@ -88,14 +106,18 @@ func (s *ChatStore) DeleteEmptySessions(ctx context.Context, cookieID string) er
 // SyncSessionSummary applies the authoritative last-message timestamp from the
 // official conversation response. observedModifyAt guards against overwriting
 // a genuinely newer live message that arrived after that response was built.
+// SyncSessionSummary 同步会话Summary。
 func (s *ChatStore) SyncSessionSummary(ctx context.Context, cookieID, chatID, summary string, sentAt, observedModifyAt int64, unread int) error {
+	// err 用于本次流程后续判断的err
 	_, err := s.DB.ExecContext(ctx, `UPDATE chat_sessions SET last_message=?,last_message_at=?,unread_count=?,updated_at=?
 		WHERE cookie_id=? AND chat_id=? AND last_message_at<=?`, summary, sentAt, unread, time.Now().UTC().Unix(),
 		cookieID, chatID, observedModifyAt)
 	return err
 }
 
+// UpdateSessionIdentity 更新会话Identity。
 func (s *ChatStore) UpdateSessionIdentity(ctx context.Context, cookieID, chatID, buyerID, buyerName, avatarURL string) error {
+	// err 用于本次流程后续判断的err
 	_, err := s.DB.ExecContext(ctx, `UPDATE chat_sessions SET
 		buyer_id=CASE WHEN ?<>'' THEN ? ELSE buyer_id END,
 		buyer_name=CASE WHEN ?<>'' THEN ? ELSE buyer_name END,
@@ -108,8 +130,11 @@ func (s *ChatStore) UpdateSessionIdentity(ctx context.Context, cookieID, chatID,
 // LatestUnmaskedPeerName recovers the most recent real nickname observed in
 // message history. Conversation summaries and profile APIs may return masked
 // names such as x***3, while older message extensions still contain the nick.
+// LatestUnmaskedPeerName 封装LatestUnmaskedPeer名称业务协调。
 func (s *ChatStore) LatestUnmaskedPeerName(ctx context.Context, cookieID, chatID string) (string, error) {
+	// name 用于本次流程后续判断的名称
 	var name string
+	// err 用于本次流程后续判断的err
 	err := s.DB.QueryRowContext(ctx, `SELECT sender_name FROM chat_messages
 		WHERE cookie_id=? AND chat_id=? AND direction='incoming' AND sender_name<>'' AND sender_name NOT LIKE '%***%'
 			AND message_type<>'system'
@@ -124,6 +149,7 @@ func (s *ChatStore) LatestUnmaskedPeerName(ctx context.Context, cookieID, chatID
 
 // SaveMessage inserts a message idempotently and updates its conversation only
 // when the message was new. This keeps retries from inflating unread counters.
+// SaveMessage 保存消息。
 func (s *ChatStore) SaveMessage(ctx context.Context, session ChatSession, message ChatMessage, unread bool) (*ChatMessage, bool, error) {
 	if s == nil || s.DB == nil {
 		return nil, false, errors.New("聊天存储未初始化")
@@ -145,7 +171,9 @@ func (s *ChatStore) SaveMessage(ctx context.Context, session ChatSession, messag
 		message.ReadAt = time.Now().UTC().UnixMilli()
 	}
 	message.CookieID, message.ChatID = session.CookieID, session.ChatID
+	// now 用于本次流程后续判断的now
 	now := time.Now().UTC().Unix()
+	// tx、err 用于本次流程后续判断的tx、err
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, false, err
@@ -153,85 +181,141 @@ func (s *ChatStore) SaveMessage(ctx context.Context, session ChatSession, messag
 	defer tx.Rollback()
 	// The composite foreign key on chat_messages requires the session to exist
 	// first. Insert an empty shell without touching an existing conversation.
+	// sessionPrefix 用于本次流程后续判断的会话Prefix
 	sessionPrefix := dialectInsertIgnorePrefix(s.Dialect)
+	// sessionInsert 用于本次流程后续判断的会话Insert
 	sessionInsert := sessionPrefix + ` INTO chat_sessions
-		(cookie_id,chat_id,buyer_id,buyer_name,buyer_avatar_url,item_id,item_title,last_message,last_message_at,unread_count,created_at,updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)` + dialectInsertIgnore(s.Dialect, []string{"cookie_id", "chat_id"})
-	if _, err := tx.ExecContext(ctx, sessionInsert, session.CookieID, session.ChatID, session.BuyerID,
-		session.BuyerName, session.BuyerAvatar, session.ItemID, session.ItemTitle, "", int64(0), 0, now, now); err != nil {
+		(cookie_id,chat_id,buyer_id,buyer_name,buyer_avatar_url,item_id,item_title,item_image_url,last_message,last_message_at,unread_count,created_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)` + dialectInsertIgnore(s.Dialect, []string{"cookie_id", "chat_id"})
+	if // err 用于本次流程后续判断的err
+	_, err := tx.ExecContext(ctx, sessionInsert, session.CookieID, session.ChatID, session.BuyerID,
+		session.BuyerName, session.BuyerAvatar, session.ItemID, session.ItemTitle, session.ItemImageURL, "", int64(0), 0, now, now); err != nil {
 		return nil, false, fmt.Errorf("建立聊天会话: %w", err)
 	}
 
+	// prefix 用于本次流程后续判断的prefix
 	prefix := dialectInsertIgnorePrefix(s.Dialect)
+	// query 保存带已读字段的幂等插入 SQL，三方言冲突时保持同一列顺序。
 	query := prefix + ` INTO chat_messages
-		(cookie_id,chat_id,message_key,direction,sender_id,sender_name,message_type,content,status,read_status,read_at,sent_at,created_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)` + dialectInsertIgnore(s.Dialect, []string{"cookie_id", "message_key"})
+		(cookie_id,chat_id,message_key,direction,sender_id,sender_name,message_type,content,media_duration,status,read_status,read_at,sent_at,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)` + dialectInsertIgnore(s.Dialect, []string{"cookie_id", "message_key"})
+	// res、err 保存插入结果及执行错误，用于判断是否更新会话摘要。
 	res, err := tx.ExecContext(ctx, query, message.CookieID, message.ChatID, message.MessageKey,
-		message.Direction, message.SenderID, message.SenderName, message.MessageType, message.Content,
+		message.Direction, message.SenderID, message.SenderName, message.MessageType, message.Content, message.MediaDuration,
 		message.Status, message.ReadStatus, message.ReadAt, message.SentAt, now)
 	if err != nil {
 		return nil, false, fmt.Errorf("保存聊天消息: %w", err)
 	}
+	// inserted 用于本次流程后续判断的inserted
 	inserted, _ := res.RowsAffected()
 	if inserted > 0 {
+		// inheritErr 保存买家后续消息确认此前出站消息已读时的失败；同一会话中的后续回复是已读历史的确定证据。
+		if message.Direction == "incoming" && message.MessageType != "system" {
+			// inheritErr 表示把后续买家消息作为已读证据回写到此前出站消息时的数据库错误。
+			_, inheritErr := tx.ExecContext(ctx, `UPDATE chat_messages SET read_status=2,
+				read_at=CASE WHEN read_status=2 AND read_at>0 THEN read_at ELSE ? END
+				WHERE cookie_id=? AND chat_id=? AND direction='outgoing' AND sent_at<=?`, message.SentAt, message.CookieID, message.ChatID, message.SentAt)
+			if inheritErr != nil {
+				return nil, false, fmt.Errorf("按后续消息确认聊天已读: %w", inheritErr)
+			}
+		}
+		// inheritErr 保存平台消息补入历史时继承本地临时消息已读回执的失败，避免同一消息因键不同长期显示未读。
+		if message.Direction == "outgoing" && strings.HasSuffix(message.MessageKey, ".PNM") {
+			// inheritErr 表示把临时出站消息的已读回执继承到平台补入历史消息时的数据库错误。
+			_, inheritErr := tx.ExecContext(ctx, `UPDATE chat_messages AS platform SET read_status=2,read_at=(SELECT local.read_at FROM chat_messages AS local
+				WHERE local.cookie_id=platform.cookie_id AND local.chat_id=platform.chat_id AND local.direction='outgoing'
+				AND local.message_key NOT LIKE '%.PNM' AND local.content=platform.content AND local.read_status=2
+				AND ABS(local.sent_at-platform.sent_at)<=10000 ORDER BY local.read_at DESC LIMIT 1)
+				WHERE platform.cookie_id=? AND platform.message_key=? AND platform.read_status<>2 AND EXISTS (SELECT 1 FROM chat_messages AS local
+				WHERE local.cookie_id=platform.cookie_id AND local.chat_id=platform.chat_id AND local.direction='outgoing'
+				AND local.message_key NOT LIKE '%.PNM' AND local.content=platform.content AND local.read_status=2
+				AND ABS(local.sent_at-platform.sent_at)<=10000)`, message.CookieID, message.MessageKey)
+			if inheritErr != nil {
+				return nil, false, fmt.Errorf("继承聊天已读回执: %w", inheritErr)
+			}
+		}
+		// unreadDelta 用于本次流程后续判断的unreadDelta
 		unreadDelta := 0
 		if unread {
 			unreadDelta = 1
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE chat_sessions SET buyer_id=?,buyer_name=?,buyer_avatar_url=?,
-			item_id=?,item_title=?,last_message=CASE WHEN last_message_at<=? THEN ? ELSE last_message END,
+		if // err 用于本次流程后续判断的err
+		_, err := tx.ExecContext(ctx, `UPDATE chat_sessions SET buyer_id=CASE WHEN ?<>'' THEN ? ELSE buyer_id END,
+			buyer_name=CASE WHEN ?<>'' THEN ? ELSE buyer_name END,buyer_avatar_url=CASE WHEN ?<>'' THEN ? ELSE buyer_avatar_url END,
+			item_id=CASE WHEN ?<>'' THEN ? ELSE item_id END,item_title=CASE WHEN ?<>'' THEN ? ELSE item_title END,
+			item_image_url=CASE WHEN ?<>'' THEN ? ELSE item_image_url END,last_message=CASE WHEN last_message_at<=? THEN ? ELSE last_message END,
 			last_message_at=CASE WHEN last_message_at<=? THEN ? ELSE last_message_at END,
 			unread_count=unread_count+?,updated_at=?
-			WHERE cookie_id=? AND chat_id=?`, session.BuyerID, session.BuyerName, session.BuyerAvatar,
-			session.ItemID, session.ItemTitle, message.SentAt, message.Content, message.SentAt, message.SentAt, unreadDelta, now,
+			WHERE cookie_id=? AND chat_id=?`, session.BuyerID, session.BuyerID, session.BuyerName, session.BuyerName, session.BuyerAvatar, session.BuyerAvatar,
+			session.ItemID, session.ItemID, session.ItemTitle, session.ItemTitle, session.ItemImageURL, session.ItemImageURL, message.SentAt, message.Content, message.SentAt, message.SentAt, unreadDelta, now,
 			session.CookieID, session.ChatID); err != nil {
 			return nil, false, fmt.Errorf("更新聊天会话: %w", err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if // err 用于本次流程后续判断的err
+	err := tx.Commit(); err != nil {
 		return nil, false, err
 	}
+	// stored、err 用于本次流程后续判断的stored、err
 	stored, err := s.GetMessageByKey(ctx, message.CookieID, message.MessageKey)
 	return stored, inserted > 0, err
 }
 
+// GetMessageByKey 读取消息ByKey。
 func (s *ChatStore) GetMessageByKey(ctx context.Context, cookieID, key string) (*ChatMessage, error) {
+	// m 保存按账号和幂等键读取的完整聊天消息。
 	var m ChatMessage
-	err := s.DB.QueryRowContext(ctx, `SELECT id,cookie_id,chat_id,message_key,direction,sender_id,sender_name,message_type,content,status,read_status,read_at,sent_at
+	// err 保存查询错误；不存在时转换为仓储统一的 ErrNotFound。
+	err := s.DB.QueryRowContext(ctx, `SELECT id,cookie_id,chat_id,message_key,direction,sender_id,sender_name,message_type,content,media_duration,status,read_status,read_at,sent_at
 		FROM chat_messages WHERE cookie_id=? AND message_key=?`, cookieID, key).Scan(
 		&m.ID, &m.CookieID, &m.ChatID, &m.MessageKey, &m.Direction, &m.SenderID, &m.SenderName,
-		&m.MessageType, &m.Content, &m.Status, &m.ReadStatus, &m.ReadAt, &m.SentAt)
+		&m.MessageType, &m.Content, &m.MediaDuration, &m.Status, &m.ReadStatus, &m.ReadAt, &m.SentAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	return &m, err
 }
 
-// UpdateMessageType refreshes the classification of an already persisted
-// message when a later history response exposes richer protocol metadata.
-func (s *ChatStore) UpdateMessageType(ctx context.Context, cookieID, key, messageType string) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE chat_messages SET message_type=?
-		WHERE cookie_id=? AND message_key=?`, messageType, cookieID, key)
+// UpdateMessageContent 用历史接口暴露的富媒体分类与地址纠正已持久化占位消息。
+// ctx 控制数据库更新生命周期；cookieID 和 key 定位消息；messageType 和 content 是新的非敏感展示内容。
+func (s *ChatStore) UpdateMessageContent(ctx context.Context, cookieID, key, messageType, content string) error {
+	// err 保存更新消息展示分类与内容地址时的数据库错误。
+	_, err := s.DB.ExecContext(ctx, `UPDATE chat_messages SET message_type=?,content=?
+		WHERE cookie_id=? AND message_key=?`, messageType, content, cookieID, key)
 	return err
 }
 
+// UpdateMessageMediaDuration 用历史载荷中的秒级时长补齐已持久化语音消息。
+// ctx 控制数据库更新生命周期；cookieID 和 key 定位消息；duration 以秒为单位，零值代表平台未提供。
+func (s *ChatStore) UpdateMessageMediaDuration(ctx context.Context, cookieID, key string, duration int64) error {
+	// err 保存更新富媒体时长时的数据库错误，调用方据此决定是否返回历史刷新失败。
+	_, err := s.DB.ExecContext(ctx, `UPDATE chat_messages SET media_duration=?
+		WHERE cookie_id=? AND message_key=?`, duration, cookieID, key)
+	return err
+}
+
+// ListSessions 读取Sessions。
 func (s *ChatStore) ListSessions(ctx context.Context, userID int64, cookieID string, limit int) ([]ChatSession, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
+	// rows、err 用于本次流程后续判断的rows、err
 	rows, err := s.DB.QueryContext(ctx, `SELECT cs.cookie_id,cs.chat_id,cs.buyer_id,cs.buyer_name,cs.buyer_avatar_url,
-		cs.item_id,cs.item_title,cs.last_message,cs.last_message_at,cs.unread_count
+		cs.item_id,cs.item_title,cs.item_image_url,cs.last_message,cs.last_message_at,cs.unread_count
 		FROM chat_sessions cs JOIN cookies c ON c.id=cs.cookie_id
 		WHERE c.user_id=? AND cs.cookie_id=? ORDER BY cs.last_message_at DESC LIMIT ?`, userID, cookieID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	// result 用于本次流程后续判断的结果
 	var result []ChatSession
 	for rows.Next() {
+		// row 用于本次流程后续判断的row
 		var row ChatSession
-		if err := rows.Scan(&row.CookieID, &row.ChatID, &row.BuyerID, &row.BuyerName, &row.BuyerAvatar,
-			&row.ItemID, &row.ItemTitle, &row.LastMessage, &row.LastMessageAt, &row.UnreadCount); err != nil {
+		if // err 用于本次流程后续判断的err
+		err := rows.Scan(&row.CookieID, &row.ChatID, &row.BuyerID, &row.BuyerName, &row.BuyerAvatar,
+			&row.ItemID, &row.ItemTitle, &row.ItemImageURL, &row.LastMessage, &row.LastMessageAt, &row.UnreadCount); err != nil {
 			return nil, err
 		}
 		result = append(result, row)
@@ -239,13 +323,16 @@ func (s *ChatStore) ListSessions(ctx context.Context, userID int64, cookieID str
 	return result, rows.Err()
 }
 
+// ListMessages 读取消息列表。
 func (s *ChatStore) ListMessages(ctx context.Context, userID int64, cookieID, chatID string, beforeID int64, limit int) ([]ChatMessage, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	query := `SELECT m.id,m.cookie_id,m.chat_id,m.message_key,m.direction,m.sender_id,m.sender_name,m.message_type,m.content,m.status,m.read_status,m.read_at,m.sent_at
+	// query 保存按时间倒序读取再反转为时间正序的分页 SQL。
+	query := `SELECT m.id,m.cookie_id,m.chat_id,m.message_key,m.direction,m.sender_id,m.sender_name,m.message_type,m.content,m.media_duration,m.status,m.read_status,m.read_at,m.sent_at
 		FROM chat_messages m JOIN cookies c ON c.id=m.cookie_id
 		WHERE c.user_id=? AND m.cookie_id=? AND m.chat_id=?`
+	// args 用于本次流程后续判断的args
 	args := []any{userID, cookieID, chatID}
 	if beforeID > 0 {
 		query += ` AND (m.sent_at < COALESCE((SELECT older.sent_at FROM chat_messages older WHERE older.id=? AND older.cookie_id=?), m.sent_at)
@@ -254,72 +341,101 @@ func (s *ChatStore) ListMessages(ctx context.Context, userID int64, cookieID, ch
 	}
 	query += ` ORDER BY m.sent_at DESC,m.id DESC LIMIT ?`
 	args = append(args, limit)
+	// rows、err 用于本次流程后续判断的rows、err
 	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	// result 用于本次流程后续判断的结果
 	var result []ChatMessage
 	for rows.Next() {
+		// m 保存当前扫描出的消息及其本地已读状态。
 		var m ChatMessage
+		// err 保存当前行字段映射错误，避免返回缺少已读字段的不完整消息。
 		if err := rows.Scan(&m.ID, &m.CookieID, &m.ChatID, &m.MessageKey, &m.Direction, &m.SenderID,
-			&m.SenderName, &m.MessageType, &m.Content, &m.Status, &m.ReadStatus, &m.ReadAt, &m.SentAt); err != nil {
+			&m.SenderName, &m.MessageType, &m.Content, &m.MediaDuration, &m.Status, &m.ReadStatus, &m.ReadAt, &m.SentAt); err != nil {
 			return nil, err
 		}
 		result = append(result, m)
 	}
 	// API returns chronological order while the query remains index-friendly.
-	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+	for // i、j 用于本次流程后续判断的i、j
+	i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
 		result[i], result[j] = result[j], result[i]
 	}
 	return result, rows.Err()
 }
 
+// MarkRead 仅对当前用户拥有账号的非系统入站消息标记已读，并同步归零会话红点。
 func (s *ChatStore) MarkRead(ctx context.Context, userID int64, cookieID, chatID string) error {
+	// now 是同一批消息和会话状态使用的统一 UTC 时间，避免页面显示先后矛盾。
 	now := time.Now().UTC()
+	// err 保存批量更新非系统入站消息的错误；失败时不得清空会话红点以避免状态不一致。
 	if _, err := s.DB.ExecContext(ctx, `UPDATE chat_messages SET read_status=2,read_at=?
 		WHERE cookie_id=? AND chat_id=? AND direction='incoming' AND message_type<>'system' AND read_status<>2`,
 		now.UnixMilli(), cookieID, chatID); err != nil {
 		return err
 	}
+	// err 保存归零会话红点的错误，该更新通过用户归属子查询阻止越权修改。
 	_, err := s.DB.ExecContext(ctx, `UPDATE chat_sessions SET unread_count=0,updated_at=?
 		WHERE cookie_id=? AND chat_id=? AND EXISTS(SELECT 1 FROM cookies c WHERE c.id=chat_sessions.cookie_id AND c.user_id=?)`,
 		now.Unix(), cookieID, chatID, userID)
 	return err
 }
 
-// CountUnreadUserMessages returns the message-level unread count used by the
-// UI badge. It deliberately excludes official/system messages and relies on
-// read_status rather than the conversation summary counter.
+// CountUnreadUserMessages 返回界面红点使用的入站真实用户未读数，系统消息永不计入。
 func (s *ChatStore) CountUnreadUserMessages(ctx context.Context, cookieID, chatID string) (int, error) {
+	// count 保存符合当前账号、会话及未读条件的消息总数。
 	var count int
+	// err 保存聚合查询错误，调用方可在平台响应缺失时退回官方红点值。
 	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM chat_messages
 		WHERE cookie_id=? AND chat_id=? AND direction='incoming' AND message_type<>'system' AND read_status<>2`, cookieID, chatID).Scan(&count)
 	return count, err
 }
 
+// UpdateMessageStatus 更新消息状态。
 func (s *ChatStore) UpdateMessageStatus(ctx context.Context, cookieID, key, status string) (*ChatMessage, error) {
-	if _, err := s.DB.ExecContext(ctx, `UPDATE chat_messages SET status=? WHERE cookie_id=? AND message_key=?`, status, cookieID, key); err != nil {
+	if // err 用于本次流程后续判断的err
+	_, err := s.DB.ExecContext(ctx, `UPDATE chat_messages SET status=? WHERE cookie_id=? AND message_key=?`, status, cookieID, key); err != nil {
 		return nil, err
 	}
 	return s.GetMessageByKey(ctx, cookieID, key)
 }
 
+// MarkMessageRead 按平台回执把目标出站消息及同会话中更早的出站消息标记为已读，并返回目标消息。
+// 回执若对应本地入站消息则原样返回且不写入，由上层识别为无需处理的跨端状态同步。
 func (s *ChatStore) MarkMessageRead(ctx context.Context, cookieID, key string, readAt int64) (*ChatMessage, error) {
+	// message 保存平台回执对应的本地消息；只有出站方向的会话和发送时间可界定本次批量确认范围。
+	message, err := s.GetMessageByKey(ctx, cookieID, key)
+	if err != nil {
+		return nil, err
+	}
+	if message.Direction != "outgoing" {
+		return message, nil
+	}
+	// readAt 保存平台已读时间；缺失时使用本机 UTC 时间作为展示回退。
 	if readAt <= 0 {
 		readAt = time.Now().UTC().UnixMilli()
 	}
-	if _, err := s.DB.ExecContext(ctx, `UPDATE chat_messages SET read_status=2,read_at=? WHERE cookie_id=? AND message_key=? AND direction='outgoing'`, readAt, cookieID, key); err != nil {
+	// err 保存按回执水位更新同会话出站历史的错误；对方读到目标消息时更早消息也已被阅读。
+	if _, err = s.DB.ExecContext(ctx, `UPDATE chat_messages SET read_status=2,
+		read_at=CASE WHEN read_status=2 AND read_at>0 THEN read_at ELSE ? END
+		WHERE cookie_id=? AND chat_id=? AND direction='outgoing' AND sent_at<=?`, readAt, cookieID, message.ChatID, message.SentAt); err != nil {
 		return nil, err
 	}
 	return s.GetMessageByKey(ctx, cookieID, key)
 }
 
+// MarkLatestOutgoingRead 在回执未带消息键时回退标记会话中最近待确认的出站消息。
 func (s *ChatStore) MarkLatestOutgoingRead(ctx context.Context, cookieID, chatID string, readAt int64) (*ChatMessage, error) {
+	// readAt 保存平台已读时间；缺失时使用本机 UTC 时间作为展示回退。
 	if readAt <= 0 {
 		readAt = time.Now().UTC().UnixMilli()
 	}
+	// key 保存最近一条已发送且未标记已读的消息幂等键。
 	var key string
+	// err 保存查询错误；没有可更新消息时返回统一 ErrNotFound。
 	err := s.DB.QueryRowContext(ctx, `SELECT message_key FROM chat_messages WHERE cookie_id=? AND chat_id=? AND direction='outgoing' AND status='sent' AND read_status<>2 ORDER BY sent_at DESC,id DESC LIMIT 1`, cookieID, chatID).Scan(&key)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound

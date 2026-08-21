@@ -5,111 +5,38 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 
-	"xianyu-go/internal/automation"
 	"xianyu-go/internal/xianyu/protocol"
 )
 
 // dispatch 是 ws.ReceiveLoop 的回调，对每条解密后的消息做：
 // 标记消息接收时间 → 提取消息 ID 去重 → 信号量限并发 → 分类（聊天/系统）→ 防抖投递。
+// dispatch 封装dispatch业务协调。
 func (a *Account) dispatch(decrypted map[string]any) {
-	ctx, ok := a.beginTask()
-	if !ok {
-		return
-	}
-	a.mu.Lock()
-	a.lastMsgReceived = time.Now()
-	a.mu.Unlock()
-
-	// 系统业务事件不能丢弃：并发满时让 WS 读取产生背压，等待处理槽位。
-	// 普通聊天仍采用非阻塞限流，避免聊天洪峰拖垮连接。
-	isSystemEvent := automation.ExtractTaskFromWS(a.CookieID, a.currentCookieStr(), decrypted) != nil
-	if isSystemEvent {
-		select {
-		case a.sem <- struct{}{}:
-		case <-ctx.Done():
-			a.taskWG.Done()
-			return
-		}
-		go func() {
-			defer a.taskWG.Done()
-			defer func() { <-a.sem }()
-			a.handleMessageContext(ctx, decrypted)
-		}()
-		return
-	}
-
-	select {
-	case a.sem <- struct{}{}:
-	default:
-		a.taskWG.Done()
-		a.logger.Warn("消息处理并发达上限，丢弃消息", "limit", MessageSemaphoreSize)
-		return
-	}
-	go func() {
-		defer a.taskWG.Done()
-		defer func() { <-a.sem }()
-		a.handleMessageContext(ctx, decrypted)
-	}()
+	a.messageDispatcher.dispatch(decrypted)
 }
 
 // handleMessage 分类并投递消息。
 func (a *Account) handleMessage(decrypted map[string]any) {
-	a.handleMessageContext(context.Background(), decrypted)
+	a.messageDispatcher.handleMessage(decrypted)
 }
 
-func (a *Account) handleMessageContext(ctx context.Context, decrypted map[string]any) {
-	if receipt, ok := extractMessageReadEvent(decrypted); ok {
-		receipt.AccountID = a.CookieID
-		if h, ok := a.handler.(MessageReadHandler); ok {
-			if err := h.HandleMessageRead(ctx, receipt); err != nil {
-				a.logger.Warn("处理聊天已读回执失败", "err", err, "message_id", receipt.MessageID)
-			}
-		} else {
-			a.logger.Debug("收到聊天已读回执，但未接入处理器", "message_id", receipt.MessageID)
-		}
-		return
-	}
-	// 第一优先级：系统卡片和平台通知进入自动化中心。
-	// 这里不判断具体业务，只做“平台事件”事实解析；系统消息永远不进入 AI 回复范围。
-	if task := automation.ExtractTaskFromWS(a.CookieID, a.currentCookieStr(), decrypted); task != nil {
-		if a.handler != nil {
-			if err := a.handler.HandleSystemEvent(ctx, *task); err != nil {
-				a.logger.Error("处理系统自动化事件失败", "err", err, "trigger", task.TriggerType)
-			}
-		}
-		return
-	}
-	if senderUserID := extractChatSenderUserID(decrypted); isSelfUserID(senderUserID, protocol.TransCookies(a.currentCookieStr())["unb"]) {
-		a.logger.Info("忽略账号自身发送的 WebSocket 聊天回显", "chat_id", extractChatID(decrypted), "sender_id", senderUserID)
-		return
-	}
-
-	chat := extractChatMessage(decrypted, a.CookieID, a.currentCookieStr())
-	if chat != nil && chat.Text != "" {
-		// 去重。
-		if !a.markAndCheckDedup(decrypted, chat) {
-			return
-		}
-		// 用户消息走防抖，合并连续文本后再进入关键词/AI/默认回复链。
-		a.scheduleDebouncedReply(*chat)
-		return
-	}
-}
-
+// extractMessageReadEvent 从解密 WebSocket 事件中提取出站消息已读回执。
 func extractMessageReadEvent(v map[string]any) (MessageReadEvent, bool) {
 	// 40103 解密后不会保留外层 objectType，只剩下固定的紧凑字段：
 	// 1=PNM 消息 ID、2=状态(2=已读)、4=会话 ID、6=事件时间。
 	// 不能只在解密后的 map 里继续寻找 "bizType":40103，否则真实回执
 	// 会被当成普通消息静默丢弃。
+	// messageID 保存紧凑回执或嵌套事件中的平台 PNM 消息 ID。
 	messageID := strings.TrimSpace(toString(v["1"]))
+	// ids 保存批量回执携带的 PNM ID 列表；ok 表示字段 1 是否采用批量编码。
 	if ids, ok := v["1"].([]any); ok && len(ids) > 0 {
 		messageID = strings.TrimSpace(toString(ids[0]))
 	}
 	if strings.HasSuffix(messageID, ".PNM") && toString(v["2"]) == "2" {
+		// chatID 保存紧凑回执携带的会话 ID，旧信封缺失时回退字段 3。
 		chatID := strings.TrimSpace(toString(v["4"]))
 		if !strings.Contains(chatID, "@goofish") {
 			chatID = strings.TrimSpace(toString(v["3"]))
@@ -117,16 +44,22 @@ func extractMessageReadEvent(v map[string]any) (MessageReadEvent, bool) {
 		chatID = strings.TrimSuffix(chatID, "@goofish")
 		return MessageReadEvent{ChatID: chatID, MessageID: messageID, ReadAt: time.Now().UTC().UnixMilli()}, true
 	}
+	// found 标记已定位 40103 信封；ev 累积其会话和消息标识；walk 递归读取兼容嵌套结构。
 	var found bool
+	// ev 保存从嵌套兼容回执中提取的平台会话与消息标识。
 	var ev MessageReadEvent
+	// walk 解析对象、数组或 JSON 字符串形式的嵌套事件，命中后停止后续遍历。
 	var walk func(any)
 	walk = func(x any) {
 		if found {
 			return
 		}
+		// m 保存当前遍历节点被识别出的具体 JSON 数据类型。
 		switch m := x.(type) {
 		case map[string]any:
+			// k 为当前字段名；val 为其原始 JSON 值，用来定位回执事件类型。
 			for k, val := range m {
+				// lk 是小写化字段名，兼容平台信封的不同字段命名。
 				lk := strings.ToLower(k)
 				if lk == "biztype" || lk == "biz_type" || lk == "type" {
 					if toString(val) == "40103" {
@@ -142,16 +75,18 @@ func extractMessageReadEvent(v map[string]any) (MessageReadEvent, bool) {
 				}
 				return
 			}
+			// child 为当前对象中的嵌套值，继续搜索未解包的回执信封。
 			for _, child := range m {
 				walk(child)
 			}
 		case []any:
+			// child 为当前批量信封中的一个候选事件。
 			for _, child := range m {
 				walk(child)
 			}
 		case string:
-			// Some sync envelopes carry the event body as an escaped JSON
-			// string instead of an already-decoded object.
+			// 部分同步信封将事件体编码为转义 JSON 字符串，而非已解码对象。
+			// decoded 保存反序列化后的事件体，兼容字符串包装的同步消息。
 			var decoded any
 			if json.Unmarshal([]byte(m), &decoded) == nil {
 				walk(decoded)
@@ -165,16 +100,22 @@ func extractMessageReadEvent(v map[string]any) (MessageReadEvent, bool) {
 	return ev, true
 }
 
+// extractNestedString 在嵌套信封中按大小写无关键名查找第一个非空字符串。
 func extractNestedString(m map[string]any, keys ...string) string {
+	// k 是当前字段名；v 是字段原值，用于大小写无关地匹配候选键。
 	for k, v := range m {
+		// want 为调用方允许的目标字段名。
 		for _, want := range keys {
 			if strings.EqualFold(k, want) && strings.TrimSpace(toString(v)) != "" {
 				return strings.TrimSpace(toString(v))
 			}
 		}
 	}
+	// v 为当前对象中的嵌套值，继续查询其中的兼容子信封。
 	for _, v := range m {
+		// child 为可继续递归解析的对象；ok 表示当前值是否是对象结构。
 		if child, ok := v.(map[string]any); ok {
+			// s 保存子信封中找到的第一个非空目标字段值。
 			if s := extractNestedString(child, keys...); s != "" {
 				return s
 			}
@@ -185,103 +126,21 @@ func extractNestedString(m map[string]any, keys ...string) string {
 
 // markAndCheckDedup 提取消息 ID，检查 1 小时内是否已处理；未处理则标记。
 // 返回 true 表示应继续处理。移植自 _schedule_debounced_reply 的去重段。
+// markAndCheckDedup 封装markAndCheckDedup业务协调。
 func (a *Account) markAndCheckDedup(decrypted map[string]any, chat *ChatMessage) bool {
-	msgID := extractMessageID(decrypted)
-	if msgID == "" {
-		// 备用标识：chat_id + text + create_time。
-		createTime := "0"
-		if m1, ok := decrypted["1"].(map[string]any); ok {
-			if t, ok := m1["5"]; ok {
-				createTime = toString(t)
-			}
-		}
-		msgID = chat.ChatID + "_" + chat.Text + "_" + createTime
-	}
-
-	a.dedupMu.Lock()
-	defer a.dedupMu.Unlock()
-	now := time.Now()
-	if last, ok := a.processed[msgID]; ok {
-		if now.Sub(last) < MessageExpireTime {
-			a.logger.Info("消息已处理过，跳过", "msg_id", truncID(msgID))
-			return false
-		}
-	}
-	a.processed[msgID] = now
-
-	// 清理：超上限时删过期记录，仍超则删最旧一半。
-	if len(a.processed) > ProcessedIDsMaxSize {
-		a.cleanupDedupLocked(now)
-	}
-	return true
+	return a.messageDispatcher.markAndCheckDedup(decrypted, chat)
 }
 
+// cleanupDedupLocked 封装cleanupDedupLocked业务协调。
 func (a *Account) cleanupDedupLocked(now time.Time) {
-	for id, t := range a.processed {
-		if now.Sub(t) > MessageExpireTime {
-			delete(a.processed, id)
-		}
-	}
-	if len(a.processed) > ProcessedIDsMaxSize {
-		// 仍超上限：按时间升序排序后删最旧一半。
-		type kv struct {
-			id string
-			t  time.Time
-		}
-		all := make([]kv, 0, len(a.processed))
-		for id, t := range a.processed {
-			all = append(all, kv{id, t})
-		}
-		sort.Slice(all, func(i, j int) bool { return all[i].t.Before(all[j].t) })
-		remove := len(all) / 2
-		for i := 0; i < remove; i++ {
-			delete(a.processed, all[i].id)
-		}
-	}
+	a.messageDispatcher.cleanupDedupLocked(now)
 }
 
 // scheduleDebouncedReply 为 chat_id 调度防抖回复：
 // 同一 chat_id 连续来消息时取消旧定时器、用最新消息重新计时，1s 后投递最后一条。
+// scheduleDebouncedReply 封装scheduleDebounced回复业务协调。
 func (a *Account) scheduleDebouncedReply(chat ChatMessage) {
-	a.debounceMu.Lock()
-	defer a.debounceMu.Unlock()
-
-	deadline := time.Now()
-	// 取消旧定时器。
-	if old, ok := a.debounceTimers[chat.ChatID]; ok && old.timer != nil {
-		old.timer.Stop()
-	}
-	entry := &debounceEntry{lastMsg: chat, deadline: deadline}
-	a.debounceTimers[chat.ChatID] = entry
-
-	entry.timer = time.AfterFunc(MessageDebounceDelay, func() {
-		a.debounceMu.Lock()
-		cur, ok := a.debounceTimers[chat.ChatID]
-		if !ok || cur.deadline != deadline {
-			// 期间有新消息，跳过旧消息处理。
-			a.debounceMu.Unlock()
-			return
-		}
-		delete(a.debounceTimers, chat.ChatID)
-		lastMsg := cur.lastMsg
-		a.debounceMu.Unlock()
-		ctx, ok := a.beginTask()
-		if !ok {
-			return
-		}
-		defer a.taskWG.Done()
-
-		if a.reply != nil {
-			if err := a.reply.Handle(ctx, lastMsg); err != nil {
-				a.logger.Error("处理自动回复失败", "err", err, "chat_id", chat.ChatID)
-			}
-		}
-		if a.handler != nil {
-			if err := a.handler.HandleChatMessage(ctx, lastMsg); err != nil {
-				a.logger.Error("处理聊天消息失败", "err", err, "chat_id", chat.ChatID)
-			}
-		}
-	})
+	a.messageDispatcher.scheduleDebouncedReply(chat)
 }
 
 // extractMessageID 提取闲鱼消息状态接口使用的消息 ID。
@@ -292,30 +151,39 @@ func (a *Account) scheduleDebouncedReply(chat ChatMessage) {
 // 上报会话已读。历史消息接口也返回 PNM ID，因此优先使用字段 3，其他
 // 字段只作为兼容旧消息或缺失字段 3 的兜底。
 func extractMessageID(decrypted map[string]any) string {
+	// m1、ok 用于本次流程后续判断的m1、ok
 	m1, ok := decrypted["1"].(map[string]any)
 	if !ok {
 		return ""
 	}
+	// id 保存实时消息最可靠的 PNM ID，存在时不可用推送关联 ID 覆盖。
 	if id := strings.TrimSpace(toString(m1["3"])); id != "" && id != "<nil>" {
 		return id
 	}
+	// m10、ok 保存消息展示扩展及其是否存在，用于兼容旧消息关联 ID。
 	m10, ok := m1["10"].(map[string]any)
 	if !ok {
 		return ""
 	}
 	// bizTag 是 JSON 字符串：{"sourceId":"...","messageId":"..."}
 	if biz, _ := m10["bizTag"].(string); biz != "" {
-		if id := parseMessageIDFromJSON(biz); id != "" {
+		if // id 用于本次流程后续判断的标识
+		id := parseMessageIDFromJSON(biz); id != "" {
 			return id
 		}
 	}
-	if ext, _ := m10["extJson"].(string); ext != "" {
-		if id := parseMessageIDFromJSON(ext); id != "" {
+	if // ext 用于本次流程后续判断的ext
+	ext, _ := m10["extJson"].(string); ext != "" {
+		if // id 用于本次流程后续判断的标识
+		id := parseMessageIDFromJSON(ext); id != "" {
 			return id
 		}
 	}
+	// reminderURL 保存提醒链接，旧消息会将推送关联 ID 编码在其查询参数中。
 	if reminderURL, _ := m10["reminderUrl"].(string); reminderURL != "" {
+		// parsed 保存已解析的提醒链接；err 表示 URL 格式不合法时的解析失败。
 		if parsed, err := url.Parse(reminderURL); err == nil {
+			// id 保存 reminderUrl 查询参数中的兼容消息关联 ID。
 			if id := strings.TrimSpace(parsed.Query().Get("messageId")); id != "" {
 				return id
 			}
@@ -324,28 +192,37 @@ func extractMessageID(decrypted map[string]any) string {
 	return findMessageID(decrypted)
 }
 
+// findMessageID 递归解析兼容消息信封中可能存在的关联消息 ID。
 func findMessageID(value any) string {
+	// x 保存当前待搜索节点的具体值，按对象、数组和 JSON 字符串分别处理。
 	switch x := value.(type) {
 	case map[string]any:
+		// key 是对象字段名；child 是字段值，用于先检查本层关联 ID。
 		for key, child := range x {
 			if strings.EqualFold(key, "messageId") || strings.EqualFold(key, "message_id") {
+				// id 保存当前字段提供的非空关联消息 ID。
 				if id := strings.TrimSpace(fmt.Sprint(child)); id != "" && id != "<nil>" {
 					return id
 				}
 			}
 		}
+		// child 为本层嵌套字段值，递归兼容更深层信封。
 		for _, child := range x {
+			// id 保存子节点中首先发现的关联消息 ID。
 			if id := findMessageID(child); id != "" {
 				return id
 			}
 		}
 	case []any:
+		// child 为批量消息中的一个候选事件或子信封。
 		for _, child := range x {
+			// id 保存数组成员中首先发现的关联消息 ID。
 			if id := findMessageID(child); id != "" {
 				return id
 			}
 		}
 	case string:
+		// decoded 保存从 JSON 字符串解码后的兼容嵌套结构。
 		var decoded any
 		if json.Unmarshal([]byte(x), &decoded) == nil {
 			return findMessageID(decoded)
@@ -354,12 +231,16 @@ func findMessageID(value any) string {
 	return ""
 }
 
+// parseMessageIDFromJSON 封装parse消息IDFromJSON业务协调。
 func parseMessageIDFromJSON(s string) string {
+	// m 用于本次流程后续判断的m
 	var m map[string]any
-	if err := json.Unmarshal([]byte(s), &m); err != nil {
+	if // err 用于本次流程后续判断的err
+	err := json.Unmarshal([]byte(s), &m); err != nil {
 		return ""
 	}
-	if id, ok := m["messageId"].(string); ok {
+	if // id、ok 用于本次流程后续判断的id、ok
+	id, ok := m["messageId"].(string); ok {
 		return id
 	}
 	return ""
@@ -367,14 +248,17 @@ func parseMessageIDFromJSON(s string) string {
 
 // extractChatMessage 从解密消息中提取聊天消息字段。
 func extractChatMessage(decrypted map[string]any, accountID, cookieStr string) *ChatMessage {
+	// m1、ok 用于本次流程后续判断的m1、ok
 	m1, ok := decrypted["1"].(map[string]any)
 	if !ok {
 		return nil
 	}
+	// m10 用于本次流程后续判断的m10
 	m10, _ := m1["10"].(map[string]any)
 	if m10 == nil {
 		return nil
 	}
+	// reminder 用于本次流程后续判断的reminder
 	reminder, _ := m10["reminderContent"].(string)
 	if reminder == "" {
 		return nil
@@ -382,23 +266,27 @@ func extractChatMessage(decrypted map[string]any, accountID, cookieStr string) *
 	if isNonUserChatNotice(m1, m10, reminder) {
 		return nil
 	}
+	// chatID 用于本次流程后续判断的聊天ID
 	chatID := toString(m1["2"])
 	// chat_id 形如 "47983389096@goofish"，去掉后缀。
 	if i := strings.Index(chatID, "@"); i >= 0 {
 		chatID = chatID[:i]
 	}
+	// senderUserID 保存经兼容字段归一后的发送者身份。
 	senderUserID := extractChatSenderUserIDFromMaps(m1, m10)
 	if isSelfUserID(senderUserID, protocol.TransCookies(cookieStr)["unb"]) {
-		// The official client echoes messages sent by this account over the
-		// same WebSocket. They are delivery observations, not new buyer input,
-		// and must never enter the automatic-reply pipeline.
+		// 官方客户端会通过同一 WebSocket 回显本账号发出的消息；它仅表示投递观察，
+		// 并非买家新输入，绝不能进入自动回复链。
 		return nil
 	}
+	// senderName 保存发送者展示名称，字段缺失时由提醒标题补齐。
 	senderName, _ := m10["senderNick"].(string)
 	if strings.TrimSpace(senderName) == "" {
 		senderName, _ = m10["reminderTitle"].(string)
 	}
+	// reminderURL 用于本次流程后续判断的reminderURL
 	reminderURL, _ := m10["reminderUrl"].(string)
+	// itemID 用于本次流程后续判断的商品ID
 	itemID := extractItemID(reminderURL)
 	return &ChatMessage{
 		AccountID:    accountID,
@@ -413,37 +301,90 @@ func extractChatMessage(decrypted map[string]any, accountID, cookieStr string) *
 	}
 }
 
-func extractChatSenderUserID(decrypted map[string]any) string {
-	m1, _ := decrypted["1"].(map[string]any)
-	if m1 == nil {
-		return ""
+// extractOwnWebSocketEcho 识别官方客户端发出后回显到当前账号 WebSocket 的普通消息。
+// decrypted 是已解密平台帧；accountID 和 cookieStr 用于归属与自身身份判断；返回值仅供出站持久化观察，绝不进入自动回复链。
+func extractOwnWebSocketEcho(decrypted map[string]any, accountID, cookieStr string) *OutgoingChatMessage {
+	// m1 保存平台聊天信封主体；ok 表示帧是否具备普通聊天的顶层结构。
+	m1, ok := decrypted["1"].(map[string]any)
+	if !ok {
+		return nil
 	}
+	// m10 保存消息展示扩展；缺失时无法安全取得文本和发送者身份。
 	m10, _ := m1["10"].(map[string]any)
-	return extractChatSenderUserIDFromMaps(m1, m10)
+	if m10 == nil {
+		return nil
+	}
+	// text 保存平台通知层给出的消息摘要；空摘要不创建无内容出站记录。
+	text, _ := m10["reminderContent"].(string)
+	if text == "" || isNonUserChatNotice(m1, m10, text) {
+		return nil
+	}
+	// senderUserID 保存归一化后的发送者身份，必须与当前账号身份一致才是自身回显。
+	senderUserID := extractChatSenderUserIDFromMaps(m1, m10)
+	// selfUserID 保存当前账号的非敏感平台身份，仅用于区分自身回显与买家入站消息。
+	selfUserID := protocol.TransCookies(cookieStr)["unb"]
+	if !isSelfUserID(senderUserID, selfUserID) {
+		return nil
+	}
+	// chatID 保存去除协议后缀后的会话标识，供出站消息与既有会话关联。
+	chatID := toString(m1["2"])
+	// suffixIndex 保存会话协议后缀的起始下标，存在时只保留平台原始会话 ID。
+	if suffixIndex := strings.Index(chatID, "@"); suffixIndex >= 0 {
+		chatID = chatID[:suffixIndex]
+	}
+	if strings.TrimSpace(chatID) == "" {
+		return nil
+	}
+	// reminderURL 保存通知深链，用于从 peerUserId 恢复会话对端身份。
+	reminderURL, _ := m10["reminderUrl"].(string)
+	// buyerID 保存深链中的对端用户标识；它不能等于当前账号，缺失时由既有会话保留原身份。
+	buyerID := extractChatPeerUserID(reminderURL, selfUserID)
+	return &OutgoingChatMessage{
+		AccountID:  accountID,
+		ChatID:     chatID,
+		BuyerID:    buyerID,
+		Text:       text,
+		MessageKey: extractMessageID(decrypted),
+	}
 }
 
+// extractChatPeerUserID 从闲鱼聊天深链读取对端用户标识，并拒绝误填为当前账号的值。
+// reminderURL 是平台通知深链；selfUserID 是当前账号身份；返回空字符串表示深链缺失或身份不可信。
+func extractChatPeerUserID(reminderURL, selfUserID string) string {
+	// parsed 保存深链解析结果；parseErr 表示平台提供了无法按 URL 解释的兼容字符串。
+	parsed, parseErr := url.Parse(strings.TrimSpace(reminderURL))
+	if parseErr != nil {
+		return ""
+	}
+	// peerUserID 保存深链查询参数中的会话对端身份，并移除 IM 协议后缀。
+	peerUserID := strings.TrimSuffix(strings.TrimSpace(parsed.Query().Get("peerUserId")), "@goofish")
+	if peerUserID == "" || isSelfUserID(peerUserID, selfUserID) {
+		return ""
+	}
+	return peerUserID
+}
+
+// extractChatSenderUserIDFromMaps 优先读取展示扩展，并兼容紧凑信封中的发送者账号 ID。
 func extractChatSenderUserIDFromMaps(m1, m10 map[string]any) string {
 	if m10 != nil {
+		// sender 保存标准 senderUserId 的去空白结果。
 		if sender := strings.TrimSpace(toString(m10["senderUserId"])); sender != "" {
 			return sender
 		}
 	}
-	// Some echoed messages omit 10.senderUserId but retain the sender in the
-	// compact 1.1 envelope.
+	// 部分回显消息缺少 10.senderUserId，但仍在紧凑 1.1 信封中保留发送者身份。
+	// sender 保存紧凑信封中的发送者对象；ok 表示该兼容字段是否存在。
 	if sender, ok := m1["1"].(map[string]any); ok {
 		return strings.TrimSpace(toString(sender["1"]))
 	}
 	return ""
 }
 
-func extractChatID(decrypted map[string]any) string {
-	m1, _ := decrypted["1"].(map[string]any)
-	chatID := strings.TrimSpace(toString(m1["2"]))
-	return strings.TrimSuffix(chatID, "@goofish")
-}
-
+// isSelfUserID 比较发送者与当前账号身份，忽略 IM 协议后缀以过滤官方客户端回显。
 func isSelfUserID(senderUserID, selfUserID string) bool {
+	// sender 是归一化后的消息发送者身份。
 	sender := strings.TrimSuffix(strings.TrimSpace(senderUserID), "@goofish")
+	// self 是归一化后的当前账号身份。
 	self := strings.TrimSuffix(strings.TrimSpace(selfUserID), "@goofish")
 	return sender != "" && self != "" && sender == self
 }
@@ -453,6 +394,7 @@ func isSelfUserID(senderUserID, selfUserID string) bool {
 // - contentType=14：“有蚂蚁森林能量可领”“不想宝贝被砍价?设置不砍价回复”“退款成功”
 // - contentType=26：交易卡片，如“我已拍下，待付款”“我发起了退款申请”
 // 付款待发货卡片已经在 handleMessage 前半段进入 automation.Center，这里不能再进入聊天回复链。
+// isNonUserChatNotice 封装isNon用户聊天Notice业务协调。
 func isNonUserChatNotice(m1, m10 map[string]any, reminder string) bool {
 	if strings.TrimSuffix(strings.TrimSpace(toString(m10["senderUserId"])), "@goofish") == "1400" {
 		return true
@@ -460,9 +402,11 @@ func isNonUserChatNotice(m1, m10 map[string]any, reminder string) bool {
 	if strings.TrimSpace(reminder) == "发来一条新消息" {
 		return true
 	}
-	if sessionType := strings.TrimSpace(toString(m10["sessionType"])); sessionType != "" && sessionType != "1" {
+	if // sessionType 用于本次流程后续判断的会话类型
+	sessionType := strings.TrimSpace(toString(m10["sessionType"])); sessionType != "" && sessionType != "1" {
 		return true
 	}
+	// contentType 用于本次流程后续判断的内容类型
 	contentType := messageContentType(m1, m10)
 	switch contentType {
 	case "14":
@@ -473,27 +417,36 @@ func isNonUserChatNotice(m1, m10 map[string]any, reminder string) bool {
 	return false
 }
 
+// messageContentType 封装消息内容类型业务协调。
 func messageContentType(m1, m10 map[string]any) string {
-	if ext, _ := m10["extJson"].(string); ext != "" {
+	if // ext 用于本次流程后续判断的ext
+	ext, _ := m10["extJson"].(string); ext != "" {
+		// extJSON 用于本次流程后续判断的extJSON
 		var extJSON map[string]any
 		if json.Unmarshal([]byte(ext), &extJSON) == nil {
-			if v := toString(extJSON["contentType"]); v != "" {
+			if // v 用于本次流程后续判断的v
+			v := toString(extJSON["contentType"]); v != "" {
 				return v
 			}
 		}
 	}
+	// m6 用于本次流程后续判断的m6
 	m6, _ := m1["6"].(map[string]any)
 	if m6 == nil {
 		return ""
 	}
+	// m63 用于本次流程后续判断的m63
 	m63, _ := m6["3"].(map[string]any)
 	if m63 == nil {
 		return ""
 	}
-	if v := toString(m63["4"]); v != "" {
+	if // v 用于本次流程后续判断的v
+	v := toString(m63["4"]); v != "" {
 		return v
 	}
-	if contentJSON, _ := m63["5"].(string); contentJSON != "" {
+	if // contentJSON 用于本次流程后续判断的内容JSON
+	contentJSON, _ := m63["5"].(string); contentJSON != "" {
+		// content 用于本次流程后续判断的内容
 		var content map[string]any
 		if json.Unmarshal([]byte(contentJSON), &content) == nil {
 			return toString(content["contentType"])
@@ -504,18 +457,23 @@ func messageContentType(m1, m10 map[string]any) string {
 
 // extractItemID 从 reminderUrl 中正则提取 itemId=xxx。
 func extractItemID(url string) string {
+	// key 用于本次流程后续判断的key
 	const key = "itemId="
+	// i 用于本次流程后续判断的i
 	i := strings.Index(url, key)
 	if i < 0 {
 		return ""
 	}
+	// s 用于本次流程后续判断的s
 	s := url[i+len(key):]
-	if j := strings.IndexAny(s, "&\n\r"); j >= 0 {
+	if // j 用于本次流程后续判断的j
+	j := strings.IndexAny(s, "&\n\r"); j >= 0 {
 		s = s[:j]
 	}
 	return s
 }
 
+// currentCookieStr 封装current登录凭证Str业务协调。
 func (a *Account) currentCookieStr() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -529,10 +487,13 @@ func (a *Account) CurrentCookieStr() string {
 
 // ---- 小工具 ----
 
+// contains 封装contains业务协调。
 func contains(s, sub string) bool { return strings.Contains(strings.ToLower(s), strings.ToLower(sub)) }
 
+// toString 封装toString业务协调。
 func toString(v any) string {
-	switch x := v.(type) {
+	switch // x 用于本次流程后续判断的x
+	x := v.(type) {
 	case nil:
 		return ""
 	case string:
@@ -541,11 +502,13 @@ func toString(v any) string {
 		// JSON 数字 → 整数字符串。
 		return trimFloatInt(x)
 	default:
+		// b 用于本次流程后续判断的b
 		b, _ := json.Marshal(v)
 		return string(b)
 	}
 }
 
+// trimFloatInt 封装trimFloatInt业务协调。
 func trimFloatInt(f float64) string {
 	if f == float64(int64(f)) {
 		return int64ToString(int64(f))
@@ -553,15 +516,19 @@ func trimFloatInt(f float64) string {
 	return ftoa(f)
 }
 
+// int64ToString 封装int64ToString业务协调。
 func int64ToString(n int64) string {
 	if n == 0 {
 		return "0"
 	}
+	// neg 用于本次流程后续判断的neg
 	neg := n < 0
 	if neg {
 		n = -n
 	}
+	// b 用于本次流程后续判断的b
 	var b [20]byte
+	// i 用于本次流程后续判断的i
 	i := len(b)
 	for n > 0 {
 		i--
@@ -575,13 +542,17 @@ func int64ToString(n int64) string {
 	return string(b[i:])
 }
 
+// ftoa 封装ftoa业务协调。
 func ftoa(f float64) string { return jsonNumber(f) }
 
+// jsonNumber 封装jsonNumber业务协调。
 func jsonNumber(f float64) string {
+	// b 用于本次流程后续判断的b
 	b, _ := json.Marshal(f)
 	return string(b)
 }
 
+// truncID 封装truncID业务协调。
 func truncID(id string) string {
 	if len(id) > 50 {
 		return id[:50] + "..."
@@ -589,6 +560,7 @@ func truncID(id string) string {
 	return id
 }
 
+// errString 封装errString业务协调。
 func errString(err error) string {
 	if err == nil {
 		return ""
@@ -596,10 +568,12 @@ func errString(err error) string {
 	return err.Error()
 }
 
+// sleepCtx 封装sleepCtx业务协调。
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return nil
 	}
+	// t 用于本次流程后续判断的t
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {

@@ -25,9 +25,14 @@ cd /Users/christ/Workspace/git/xianyu/Ydisks-Xianyu-Helper
 
 make build      # go build ./cmd/server
 make test       # go test ./...
+make test-server       # go test ./internal/server
+make test-server-race  # server 生命周期与凭证并发 smoke race
 make vet        # go vet ./...
 make lint       # golangci-lint run ./... (0 issues baseline)
 make check      # vet + lint + test
+make cover      # Go 全量覆盖率（默认不启动 Chromium）
+make cover-browser # 本地 Chromium 页面与 CDP 覆盖率
+make cover-frontend # 前端 V8 覆盖率（文本/JSON/HTML）
 make frontend   # build frontend into internal/webui/static
 ```
 
@@ -42,7 +47,7 @@ On a new database, open the management page after starting the server. The first
 and confirms an administrator password, creates the `admin` user, and signs the user in automatically.
 The CLI bootstrap remains available for headless or operational environments.
 
-Disable browser automation when Chromium is unavailable:
+Disable browser automation only when the user explicitly requests it or explicitly confirms that Chromium is unavailable. Unless the user gives that direction, agents MUST NOT add `-no-browser` when starting the server:
 
 ```bash
 go run ./cmd/server -db data/xianyu_data.db -addr :59188 -no-browser
@@ -90,6 +95,179 @@ npm run dev
 ```
 
 Vite proxies backend routes to `localhost:59188`. Production builds are written to `internal/webui/static/` and embedded by the Go server.
+
+## Mandatory refactoring governance — DO NOT SKIP
+
+The repository is following the authoritative long-term plan in
+`docs/architecture/refactoring-master-plan.md`. Before changing Go package boundaries, HTTP APIs, database
+access, account credentials, application wiring, React page structure, tests, CI or compatibility behavior,
+agents MUST read all of:
+
+- `docs/architecture/refactoring-master-plan.md`
+- `docs/architecture/dependency-rules.md`
+- `docs/architecture/comment-standard.md`
+- `docs/slider-captcha-frozen-spec.md` when credentials, login, engine, account, server or browser call paths are involved
+
+The authoritative schedule has exactly six formal phases and is defined only by
+`docs/architecture/refactoring-master-plan.md`. Before editing, read its state table. Do not infer a phase from
+old commits, a document heading, implementation that happened to land early, or a historical completion claim.
+
+Each phase is one task, one review unit and one final Chinese commit. A phase may change every package, feature,
+test, gate and document required by its stated scope. Agents MUST NOT split it into vertical slices, milestones,
+separately delivered subtasks, independent PRs, or intermediate commits. The worktree may be temporarily
+non-compiling only while the single phase is in progress; its final commit must compile, start, pass every listed
+verification and have complete evidence recorded once in `refactoring-progress.md`.
+
+The complete architecture-gate catalog is established before production migration. `tools/architecturecheck`
+reads the single current phase from the master plan, activates that phase and every earlier gate, and fails when
+the phase state is missing or ambiguous. After phase six is complete, every gate remains permanently active.
+Agents must not defer gate design to phase six, enable a future phase
+early, or bypass an active gate with a whitelist, baseline, ignored path or warning-only result.
+
+Do not use a large phase change to hide unfinished branches, error paths or unverified behavior. Do not weaken,
+skip or delete tests; reformat or rename unrelated code; upgrade unrelated dependencies; delete coverage; expand
+a compatibility whitelist; or change frozen CAPTCHA behavior. Preserve unrelated working-tree changes.
+
+Compatibility adapters remain until every known caller has migrated and contract tests prove removal. Emergency
+bug or security fixes may precede the plan only when narrowly scoped and recorded in the master plan.
+
+## Mandatory Chinese comments for all functions and variables
+
+`docs/architecture/comment-standard.md` is authoritative. This requirement is intentionally stricter than
+normal Go exported-symbol documentation rules and applies to Go, TypeScript and TSX production and test code.
+
+Agents MUST:
+
+- add accurate Chinese comments for every new or modified function, method, anonymous function, parameter,
+  return value, package/module variable, constant, field, local variable, short declaration, loop variable,
+  callback parameter, React state value, setter, ref and memoized value;
+- explain all variables in a multi-variable declaration in one nearby comment when appropriate;
+- explain business meaning, input/output semantics, units, lifecycle, ownership, cancellation, concurrency,
+  sensitivity or compatibility constraints instead of translating the identifier or restating syntax;
+- update comments in the same change whenever behavior or ownership changes;
+- clear historical comment-baseline entries for every file or logical unit materially refactored;
+- keep generated code, third-party code and `internal/webui/static` out of manual comment backfills.
+
+Automated checks can prove only presence and Chinese text. Reviewers and agents remain responsible for semantic
+accuracy. Placeholder comments such as “err 表示错误” or “count 表示数量” are forbidden. Comments must never
+contain real Cookie, Token, password, SMTP credential or production secret values.
+
+Until the historical baseline is removed, untouched legacy declarations may remain exempt, but no task may add
+new debt or use the baseline to exempt newly created or semantically modified declarations.
+
+Run `make comments` (or `go run ./tools/commentlint -mode check -root . -baseline .commentlint/go-baseline.json`
+and `npm --prefix frontend run comments:check`) for the mandatory AST presence gate. Baseline regeneration is a
+reviewed maintenance operation only: use `make comments-baseline` after clearing the affected file's historical
+debt and record the scope in `docs/architecture/refactoring-master-plan.md`.
+
+## Mandatory coverage policy
+
+- Every new or modified deterministic function, branch and error path MUST have a focused test. Prefer injected
+  dependencies, local `httptest` servers, in-memory databases and local Playwright pages over real platform calls.
+- Run `make cover` for the ordinary Go baseline, `make cover-browser` when Chromium is available, and
+  `make cover-frontend` for the React/Vite V8 report. Coverage reports are verification artifacts and MUST NOT be
+  committed (`cover*.out` and `frontend/coverage/` remain generated files).
+- Do not exclude production business files, lower thresholds, mark business code as ignored, or weaken assertions
+  merely to improve a percentage. Per the current user requirement, pure React UI components are outside the business
+  coverage target and may be excluded by the frontend coverage configuration; their business behavior must remain in
+  tested Hook/state/service modules. Any remaining uncovered business code must be classified in the plan as
+  deterministic work, environment-only work, or real-account/external-platform work.
+- Tests may skip only behavior that genuinely requires a real account, private platform state, or an unavailable
+  external service. Local browser behavior, error handling, cancellation, lifecycle, parsing and UI state transitions
+  MUST use deterministic fixtures and remain covered.
+- A coverage claim MUST include the command, whether `RUN_BROWSER_INTEGRATION=1` was used, the Go and frontend
+  statement percentages, and the exact real-account/external-platform exceptions.
+
+## Mandatory target dependency boundaries
+
+`docs/architecture/dependency-rules.md` is authoritative. During migration, existing violations may remain only
+until their recorded phase is completed; agents MUST NOT add new violations.
+
+- `cmd` handles configuration, dependency construction, signals and lifecycle only; no new business rules, SQL,
+  HTTP handlers or protocol parsing belong there.
+- `internal/server` is the HTTP/SPA transport. Do not add new direct `Store.DB`, transaction, MTOP, browser,
+  credential-renewal, business-worker or platform-session logic. New use cases go through application services.
+- Application services own use-case orchestration, authorization and transaction boundaries and must not depend
+  on `net/http`, chi or frontend compatibility fields.
+- Interfaces are defined by consumers and kept minimal. Do not add a service locator, universal repository
+  interface or runtime setter for a required dependency.
+- `internal/db` owns SQL, dialects, migrations, encryption-at-rest and repository implementations. It must not
+  import upper layers or decide HTTP responses.
+- `internal/xianyu` and `internal/browser` own platform and browser implementation. They must not write business
+  data directly, decide automation rules or depend on the HTTP/application layer.
+- `internal/engine` and `internal/automation` must remain independent of Server. New mutable concurrent state
+  requires explicit ownership, lock, Context, goroutine and shutdown documentation plus focused tests.
+- Cross-repository atomic work belongs behind an application-level Unit of Work. New handlers must not call
+  `BeginTx` directly.
+
+## Mandatory sensitive-data boundaries
+
+- Account summaries and ownership checks MUST NOT read or decrypt Cookie, Token, password or encrypted metadata.
+- Platform credentials and password-login secrets use separate models and purpose-specific repository methods.
+- Sensitive persistence models MUST NOT be serialized as HTTP responses or frontend state.
+- Logs, notifications, API errors and test failure output MUST NOT contain plaintext credentials.
+- New ownership checks return existence/non-sensitive identity rather than maps of decrypted Cookie values.
+- Do not hold credential locks across slow external I/O unless an authoritative protocol invariant explicitly
+  requires it and the lock order is documented and tested.
+
+## Mandatory HTTP API constraints
+
+- New APIs use the `/api/v1` prefix unless the current task is an explicit compatibility fix.
+- New request and response bodies use named DTOs. Do not add anonymous handler request structs, dynamic
+  `map[string]any` response contracts or direct DB-model serialization.
+- New failures use the unified error envelope and correct HTTP status. Do not add HTTP 200 + `success:false` or
+  new `detail`/`msg`/`error` aliases.
+- DB models, domain models and transport DTOs remain distinct. Compatibility normalization belongs only at the
+  transport adapter boundary.
+- Route-prefix changes require `frontend/vite.config.ts`, frontend API callers, contract tests and embedded assets
+  to be updated together.
+- `api/openapi.yaml` is the only contract source for `/api/v1/**` and `/health`; every new versioned operation must
+  update the specification, regenerate `frontend/shared/api-contract/generated/schema.ts`, and add a real handler
+  contract test before a feature can call it. Generated types are read-only, and feature UI models must remain behind
+  their own API adapters.
+
+## Mandatory React constraints
+
+- New frontend code follows `app -> features -> shared`; a feature must not import another feature's internal
+  files, and shared code must not import features.
+- React components must not call `fetch` or `axios` directly. Use the shared HTTP client through a feature API
+  adapter; keep domain normalization out of the generic client.
+- Do not store derivable values in state. Put user-triggered side effects in event handlers, split effects with
+  different dependencies, and use functional state updates when the next value depends on the previous value.
+- Every async effect or request must define cancellation or latest-generation behavior so stale responses cannot
+  replace current state. Independent requests should start in parallel.
+- Do not add memoization without a concrete expensive calculation or stable-child-prop reason. Do not define
+  child components inside parent components.
+- Keep server data, form state and transient UI state separate. Heavy pages and heavy optional dependencies use
+  route/feature-level lazy loading where practical.
+- New or materially changed user flows require behavior tests for success, failure, cancellation, switching and
+  stale responses. Source-string tests are reserved for static architecture rules.
+- Generated API types are read-only; feature adapters convert transport DTOs to UI models.
+- Feature code must not import the generated schema directly, restore `transport.ts`, or import legacy
+  `get/post/put/del/postForm`; only the shared contract runtime may call `fetch`.
+
+## Mandatory database, transaction and multi-dialect constraints
+
+- Do not expose new raw `*sql.DB` access to upper layers. Add narrow repository methods or an explicit Unit of
+  Work instead.
+- SQL row structs, persistence models, domain models and HTTP DTOs must not be collapsed into one convenience
+  type when they have different sensitivity or ownership.
+- Every migration keeps SQLite, MySQL and PostgreSQL numbering and final schema aligned.
+- Database behavior changes require focused SQLite tests and, when available, MySQL/Postgres regression or
+  `cmd/dbverify` evidence.
+- Repository/package splitting is permitted only after consumer interfaces and transaction boundaries are clear;
+  directory count is not a goal and package cycles must not be hidden behind globals or reflection.
+
+## Mandatory lifecycle and concurrency constraints
+
+- Background goroutines require a documented owner, Context source, cancellation path and Wait/Join path.
+- Start methods must not make partially constructed objects observable. Stop/Close must be idempotent when the
+  component contract allows repeated shutdown.
+- The sender closes a channel unless a more specific documented ownership rule applies.
+- Do not perform uncontrolled network, browser or user-wait I/O while holding a mutex.
+- Types with concurrent use must document which locks protect which fields and the allowed lock order.
+- Required dependencies are constructor inputs and validated before Start; mutable setters are only for optional
+  runtime configuration or isolated tests and must not create an invalid intermediate production state.
 
 ## Desktop packaging and service behavior
 
@@ -175,6 +353,10 @@ Windows uses `packaging/windows/installer.iss`; macOS uses `packaging/macos/buil
 the directory containing `install.sh`, `uninstall.sh`, the systemd unit, binaries and matching runtime.
 
 ## Architecture
+
+The following paragraphs describe the current runtime wiring. They are not permission to add more business
+logic to HTTP handlers. The mandatory target architecture and the allowed transition path are defined in
+`docs/architecture/refactoring-master-plan.md` and `docs/architecture/dependency-rules.md`.
 
 `cmd/server/main.go` opens the database (SQLite/MySQL/Postgres by URL scheme), constructs the adapter + account manager + automation center + notifier, starts enabled account runtimes, initializes the optional in-process browser manager, and starts the HTTP server. Business logic does not live in `main.go` — it delegates to `internal/adapter` (Handler/OrderDetailFetcher wiring), `internal/engine`, `internal/account`, `internal/automation`, and domain-specific server handlers.
 

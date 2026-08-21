@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"xianyu-go/internal/db"
 )
@@ -22,7 +23,18 @@ type ReplyResult struct {
 	Source    string // 回复来源：API/关键词/AI/默认
 	Skip      bool   // true 表示匹配到空回复，不发送任何内容
 	ReplyOnce bool   // 仅默认回复使用，发送状态由 Handle 持久化
+	// AutoPriceQuote 是 AI 已明确承诺且通过价格边界校验的可执行报价。
+	AutoPriceQuote *AIPriceQuoteProposal
 }
+
+// AIPriceQuoteProposal 是等待回复发送成功后绑定到会话的 AI 报价。
+type AIPriceQuoteProposal struct {
+	// PriceCents 是以分为单位的单件成交报价；订单执行时按已知购买数量折算总价。
+	PriceCents int64
+}
+
+// aiQuoteValidity 是 AI 报价从成功发送开始允许自动应用到新订单的时长。
+const aiQuoteValidity = 30 * time.Minute
 
 // APIReplier 外部 API 回复（优先级1）。返回 nil 表示无回复。
 type APIReplier interface {
@@ -37,7 +49,7 @@ type AIReplier interface {
 // MessageSender 是回复服务发送文本/图片所需的最小接口。
 type MessageSender interface {
 	SendText(ctx context.Context, chatID, toUserID, text string) error
-	SendImage(ctx context.Context, chatID, toUserID, imageURL string, cardID int64) error
+	SendImage(ctx context.Context, chatID, toUserID, imageURL string, cardID int64, width, height int) error
 }
 
 // ReplyService 单账号回复服务。
@@ -68,7 +80,9 @@ func NewReplyService(cookieID string, store *db.Store, sender MessageSender,
 
 // Handle 收到一条聊天消息，按四级优先级回复。
 // 由 Account 在防抖后调用。返回是否产生了回复。
+// Handle 处理当前值。
 func (r *ReplyService) Handle(ctx context.Context, m ChatMessage) error {
+	// res 用于本次流程后续判断的响应
 	res := r.resolve(ctx, m)
 	if res == nil || res.Skip {
 		return nil
@@ -78,9 +92,12 @@ func (r *ReplyService) Handle(ctx context.Context, m ChatMessage) error {
 	if r.sender == nil {
 		return nil
 	}
+	// record 用于本次流程后续判断的record
 	record := db.DefaultReplyRecord{}
 	if res.ReplyOnce && m.ChatID != "" {
+		// claimed 用于本次流程后续判断的claimed
 		var claimed bool
+		// err 用于本次流程后续判断的err
 		var err error
 		record, claimed, err = r.store.DefaultReps.ClaimRecord(ctx, r.cookieID, m.ChatID, res.Text != "", res.ImageURL != "")
 		if err != nil {
@@ -91,33 +108,48 @@ func (r *ReplyService) Handle(ctx context.Context, m ChatMessage) error {
 		}
 	}
 	if res.ImageURL != "" && !record.ImageSent {
-		if err := r.sender.SendImage(ctx, m.ChatID, m.SenderUserID, res.ImageURL, 0); err != nil {
+		if // err 用于本次流程后续判断的err
+		err := r.sender.SendImage(ctx, m.ChatID, m.SenderUserID, res.ImageURL, 0, 0, 0); err != nil {
 			r.logger.Error("发送回复图片失败", "err", err)
 			r.markReplyFailure(ctx, res, m, err)
 			return err
 		}
 		if res.ReplyOnce && m.ChatID != "" {
-			if err := r.store.DefaultReps.MarkPartSent(ctx, r.cookieID, m.ChatID, "image"); err != nil {
+			if // err 用于本次流程后续判断的err
+			err := r.store.DefaultReps.MarkPartSent(ctx, r.cookieID, m.ChatID, "image"); err != nil {
 				r.markReplyFailure(ctx, res, m, err)
 				return err
 			}
 		}
 	}
 	if res.Text != "" && !record.TextSent {
-		if err := r.sender.SendText(ctx, m.ChatID, m.SenderUserID, res.Text); err != nil {
+		if // err 用于本次流程后续判断的err
+		err := r.sender.SendText(ctx, m.ChatID, m.SenderUserID, res.Text); err != nil {
 			r.logger.Error("发送回复文本失败", "err", err)
 			r.markReplyFailure(ctx, res, m, err)
 			return err
 		}
 		if res.ReplyOnce && m.ChatID != "" {
-			if err := r.store.DefaultReps.MarkPartSent(ctx, r.cookieID, m.ChatID, "text"); err != nil {
+			if // err 用于本次流程后续判断的err
+			err := r.store.DefaultReps.MarkPartSent(ctx, r.cookieID, m.ChatID, "text"); err != nil {
 				r.markReplyFailure(ctx, res, m, err)
 				return err
 			}
 		}
+		if res.Source == "AI" && res.AutoPriceQuote != nil && m.ChatID != "" && m.SenderUserID != "" && m.ItemID != "" {
+			// quote 把模型承诺价格绑定到当前账号、买家、商品和已成功发送的会话。
+			quote := db.AIBargainQuote{CookieID: r.cookieID, ChatID: m.ChatID, BuyerID: m.SenderUserID, ItemID: m.ItemID, PriceCents: res.AutoPriceQuote.PriceCents}
+			// expiresAt 是固定 30 分钟报价有效期的 Unix 秒时间。
+			expiresAt := time.Now().UTC().Add(aiQuoteValidity).Unix()
+			// err 是已发送报价写入失败原因，失败时必须阻止静默丢失自动改价承诺。
+			if err := r.store.AIReply.ReplacePendingQuote(ctx, quote, expiresAt); err != nil {
+				return fmt.Errorf("保存已发送的 AI 自动改价报价: %w", err)
+			}
+		}
 	}
 	if res.ReplyOnce && m.ChatID != "" {
-		if err := r.store.DefaultReps.MarkRecordSent(ctx, r.cookieID, m.ChatID); err != nil {
+		if // err 用于本次流程后续判断的err
+		err := r.store.DefaultReps.MarkRecordSent(ctx, r.cookieID, m.ChatID); err != nil {
 			r.markReplyFailure(ctx, res, m, err)
 			return err
 		}
@@ -125,6 +157,7 @@ func (r *ReplyService) Handle(ctx context.Context, m ChatMessage) error {
 	return nil
 }
 
+// markReplyFailure 封装mark回复Failure业务协调。
 func (r *ReplyService) markReplyFailure(ctx context.Context, res *ReplyResult, m ChatMessage, sendErr error) {
 	if res.ReplyOnce && m.ChatID != "" {
 		_ = r.store.DefaultReps.MarkRecordFailed(ctx, r.cookieID, m.ChatID, sendErr.Error())
@@ -135,7 +168,8 @@ func (r *ReplyService) markReplyFailure(ctx context.Context, res *ReplyResult, m
 func (r *ReplyService) resolve(ctx context.Context, m ChatMessage) *ReplyResult {
 	// 优先级1：API 回复。
 	if r.api != nil {
-		if res, err := r.api.Reply(ctx, m); err != nil {
+		if // res、err 用于本次流程后续判断的res、err
+		res, err := r.api.Reply(ctx, m); err != nil {
 			r.logger.Error("API 回复失败", "err", err)
 		} else if res != nil {
 			res.Source = "API"
@@ -150,7 +184,8 @@ func (r *ReplyService) resolve(ctx context.Context, m ChatMessage) *ReplyResult 
 
 	// 优先级3：AI 回复。
 	if r.ai != nil {
-		if res, err := r.ai.Reply(ctx, m); err != nil {
+		if // res、err 用于本次流程后续判断的res、err
+		res, err := r.ai.Reply(ctx, m); err != nil {
 			r.logger.Error("AI 回复失败", "err", err)
 		} else if res != nil {
 			res.Source = "AI"
@@ -165,15 +200,19 @@ func (r *ReplyService) resolve(ctx context.Context, m ChatMessage) *ReplyResult 
 // keywordReply 关键词匹配。返回 nil 表示无匹配；
 // 返回 Skip=true 表示匹配到空回复（不发送）。
 // 移植自 get_keyword_reply：商品ID关键词优先 → 通用关键词。
+// keywordReply 封装关键词回复业务协调。
 func (r *ReplyService) keywordReply(ctx context.Context, m ChatMessage) *ReplyResult {
+	// kws、err 用于本次流程后续判断的kws、err
 	kws, err := r.store.Keywords.AllWithType(ctx, r.cookieID)
 	if err != nil || len(kws) == 0 {
 		return nil
 	}
+	// msgLower 用于本次流程后续判断的msgLower
 	msgLower := strings.ToLower(m.Text)
 
 	// 1. 商品ID关键词优先。
 	if m.ItemID != "" {
+		// kw 表示当前遍历过程中的kw
 		for _, kw := range kws {
 			if kw.ItemID == m.ItemID && strings.Contains(msgLower, strings.ToLower(kw.Keyword)) {
 				return r.keywordResult(kw, m)
@@ -189,6 +228,7 @@ func (r *ReplyService) keywordReply(ctx context.Context, m ChatMessage) *ReplyRe
 	return nil
 }
 
+// keywordResult 封装关键词结果业务协调。
 func (r *ReplyService) keywordResult(kw db.Keyword, m ChatMessage) *ReplyResult {
 	if kw.Type == "image" && kw.ImageURL != "" {
 		return &ReplyResult{ImageURL: kw.ImageURL, Source: "关键词"}
@@ -201,10 +241,12 @@ func (r *ReplyService) keywordResult(kw db.Keyword, m ChatMessage) *ReplyResult 
 
 // defaultReply 默认回复。移植自 get_default_reply：
 // 指定商品回复优先 → 账号默认回复（reply_once 防重复 + 变量替换）。
+// defaultReply 封装default回复业务协调。
 func (r *ReplyService) defaultReply(ctx context.Context, m ChatMessage) *ReplyResult {
 	// 1. 指定商品回复。
 	if m.ItemID != "" {
-		if ir, err := r.store.ItemReps.Get(ctx, r.cookieID, m.ItemID); err == nil && ir != nil && strings.TrimSpace(ir.ReplyContent) != "" {
+		if // ir、err 用于本次流程后续判断的ir、err
+		ir, err := r.store.ItemReps.Get(ctx, r.cookieID, m.ItemID); err == nil && ir != nil && strings.TrimSpace(ir.ReplyContent) != "" {
 			return &ReplyResult{Text: formatReplyWithItem(ir.ReplyContent, m), Source: "默认"}
 		}
 	}
@@ -217,6 +259,7 @@ func (r *ReplyService) defaultReply(ctx context.Context, m ChatMessage) *ReplyRe
 	if strings.TrimSpace(dr.ReplyContent) == "" && strings.TrimSpace(dr.ReplyImageURL) == "" {
 		return &ReplyResult{Skip: true, Source: "默认"}
 	}
+	// res 用于本次流程后续判断的响应
 	res := &ReplyResult{Source: "默认", ReplyOnce: dr.ReplyOnce}
 	if strings.TrimSpace(dr.ReplyContent) != "" {
 		res.Text = formatReply(dr.ReplyContent, m)
@@ -229,6 +272,7 @@ func (r *ReplyService) defaultReply(ctx context.Context, m ChatMessage) *ReplyRe
 
 // formatReply 变量替换：{send_user_name} {send_user_id} {send_message}。
 // 替换回复模板变量；若替换出错则返回原文。
+// formatReply 封装format回复业务协调。
 func formatReply(template string, m ChatMessage) string {
 	return safeFormat(template, map[string]string{
 		"send_user_name": m.SenderName,
@@ -249,7 +293,9 @@ func formatReplyWithItem(template string, m ChatMessage) string {
 
 // safeFormat 实现命名占位符替换。
 func safeFormat(template string, vars map[string]string) string {
+	// out 用于本次流程后续判断的out
 	out := template
+	// k、v 表示当前遍历过程中的k、v
 	for k, v := range vars {
 		out = strings.ReplaceAll(out, "{"+k+"}", v)
 	}

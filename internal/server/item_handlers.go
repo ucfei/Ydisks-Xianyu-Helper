@@ -1,20 +1,18 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	accountapp "xianyu-go/internal/application/account"
+	itemapp "xianyu-go/internal/application/items"
 	"xianyu-go/internal/auth"
-	"xianyu-go/internal/db"
-	"xianyu-go/internal/xianyu/mtop"
 )
 
 // mountItemsReal 物品端点（真实实现）。
@@ -41,270 +39,146 @@ func (s *Server) mountItemsReal(r chi.Router) {
 	r.Put("/items/{cookie_id}/{item_id}/multi-quantity-delivery", s.setItemMultiQuantity)
 }
 
+// publishItem 解析 HTTP 发布请求并调用商品发布应用服务完成单商品发布。
 func (s *Server) publishItem(w http.ResponseWriter, r *http.Request) {
-	// 最多 9 张 10 MiB 图片，额外预留 multipart 元数据空间。
-	r.Body = http.MaxBytesReader(w, r.Body, maxItemPublishBytes)
-	// #nosec G120 -- 请求体已由 MaxBytesReader 限制。
-	if err := r.ParseMultipartForm(maxOrderImportBytes); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式错误，请使用 multipart/form-data")
+	// 最多 9 张 10 MiB 图片，额外预留 multipart 元数据空间；解析失败会区分请求格式、boundary 损坏和超限。
+	if !parseMultipartRequest(w, r, maxItemPublishBytes, maxOrderImportBytes, "商品发布图片总大小不能超过 96 MiB") {
 		return
 	}
+	// cookieID 用于本次流程后续判断的登录凭证ID
 	cookieID := strings.TrimSpace(r.FormValue("cookie_id"))
 	if cookieID == "" {
 		writeErr(w, http.StatusBadRequest, "请选择发布账号")
 		return
 	}
+	// userID、ok 用于本次流程后续判断的用户ID、ok
 	_, userID, ok := s.cookieForCurrentUser(w, r, cookieID)
 	if !ok {
 		return
 	}
+	// title 用于本次流程后续判断的标题
 	title := strings.TrimSpace(r.FormValue("title"))
+	// description 用于本次流程后续判断的description
 	description := strings.TrimSpace(r.FormValue("description"))
+	// priceCents、err 用于本次流程后续判断的priceCents、err
 	priceCents, err := parseMoneyCents(r.FormValue("price"))
 	if err != nil || priceCents <= 0 {
 		writeErr(w, http.StatusBadRequest, "商品价格必须大于 0")
 		return
 	}
+	// origCents、err 用于本次流程后续判断的origCents、err
 	origCents, err := parseMoneyCents(r.FormValue("original_price"))
 	if err != nil || origCents < 0 {
 		writeErr(w, http.StatusBadRequest, "商品原价格式错误")
 		return
 	}
+	// quantity、err 用于本次流程后续判断的quantity、err
 	quantity, err := strconv.Atoi(strings.TrimSpace(r.FormValue("quantity")))
 	if err != nil || quantity <= 0 {
 		writeErr(w, http.StatusBadRequest, "库存数量必须大于 0")
 		return
 	}
+	// postageMode 用于本次流程后续判断的postage模式
 	postageMode := strings.TrimSpace(r.FormValue("postage_mode"))
 	if postageMode == "" {
 		postageMode = "free"
 	}
+	// postageCents、err 用于本次流程后续判断的postageCents、err
 	postageCents, err := parseMoneyCents(r.FormValue("postage"))
 	if err != nil || postageCents < 0 || (postageMode == "fixed" && postageCents <= 0) {
 		writeErr(w, http.StatusBadRequest, "固定邮费必须大于 0")
 		return
 	}
+	// images、err 用于本次流程后续判断的images、err
 	images, err := readPublishImages(r, 9)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	var location mtop.PublishLocation
-	var selectedLocation *mtop.PublishLocation
-	if rawLocation := strings.TrimSpace(r.FormValue("location")); rawLocation != "" {
-		if err := json.Unmarshal([]byte(rawLocation), &location); err != nil {
+	// location 保存带有 JSON 标签的 HTTP 发货地请求模型。
+	var location itemPublishLocationRequest
+	// selectedLocation 保存解析成功、待转换为应用模型的发货地。
+	var selectedLocation *itemPublishLocationRequest
+	if // rawLocation 用于本次流程后续判断的原始地址
+	rawLocation := strings.TrimSpace(r.FormValue("location")); rawLocation != "" {
+		if // err 用于本次流程后续判断的err
+		err := json.Unmarshal([]byte(rawLocation), &location); err != nil {
 			writeErr(w, http.StatusBadRequest, "发货地格式错误，请重新定位")
 			return
 		}
 		selectedLocation = &location
 	}
-	credentialUnlock := s.Store.LockAccountCredentials(cookieID)
-	latest, err := s.Store.Cookies.GetDetails(r.Context(), cookieID)
-	if err != nil || latest == nil || latest.UserID != userID || !hasStoredCookieCredential(latest) {
-		credentialUnlock()
-		writeErr(w, http.StatusConflict, "账号凭证已变化，请重试")
-		return
-	}
-	cookieValue := latest.Value
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-	defer cancel()
-	client := s.mtopClient()
-	mtopCtx, cookieSession := withMTopCookieSnapshot(ctx, latest)
-	publishReq := mtop.PublishItemRequest{
-		Title:              title,
-		Description:        description,
-		PriceCents:         priceCents,
-		OriginalPriceCents: origCents,
-		Quantity:           quantity,
-		PostageMode:        postageMode,
-		PostageCents:       postageCents,
-		Virtual:            true,
-		Location:           selectedLocation,
-		Images:             images,
-	}
-	res, callErr := client.PublishItem(mtopCtx, cookieValue, publishReq)
-	runtimeCookie := ""
-	runtimeCookieChanged := false
-	var responseCookieErr error
-	value, valueChanged, handled, persistErr := s.persistMTopCookieSessionLocked(r.Context(), latest, cookieSession)
-	if persistErr != nil {
-		s.Logger.Error("保存发布响应 Cookie Jar 失败", "cookie_id", cookieID, "err", persistErr)
-		responseCookieErr = persistErr
-	} else if handled {
-		if valueChanged {
-			runtimeCookie = value
-			runtimeCookieChanged = true
-		}
-	} else if callErr == nil && res != nil && res.UpdatedCookies != "" && res.UpdatedCookies != cookieValue {
-		if saveErr := s.Store.Cookies.UpdateValueOwned(r.Context(), cookieID, res.UpdatedCookies, userID); saveErr != nil {
-			s.Logger.Error("保存刷新后的 cookie 失败", "cookie_id", cookieID, "err", saveErr)
-			responseCookieErr = saveErr
-		} else {
-			runtimeCookie = res.UpdatedCookies
-			runtimeCookieChanged = true
+	// applicationLocation 是 HTTP DTO 转换后的应用发货地模型。
+	var applicationLocation *itemapp.Location
+	if selectedLocation != nil {
+		applicationLocation = &itemapp.Location{
+			Area: selectedLocation.Area, City: selectedLocation.City, DivisionID: selectedLocation.DivisionID,
+			Longitude: selectedLocation.Longitude, Latitude: selectedLocation.Latitude, POIID: selectedLocation.POIID,
+			POIName: selectedLocation.POIName, Province: selectedLocation.Province,
 		}
 	}
-	credentialUnlock()
-	if runtimeCookieChanged {
-		s.updateRunningCookie(r.Context(), cookieID, runtimeCookie)
+	// applicationImages 是 HTTP 上传图片转换后的应用图片模型。
+	applicationImages := make([]itemapp.Image, 0, len(images))
+	// image 表示当前待转换的 HTTP 上传图片。
+	for _, image := range images {
+		applicationImages = append(applicationImages, itemapp.Image{Filename: image.Filename, ContentType: image.ContentType, Data: image.Data})
 	}
+	// outcome、callErr 保存应用服务返回的发布结果及调用错误。
+	outcome, callErr := s.itemSinglePublishApplication().PublishSingle(r.Context(), itemapp.PublishInput{
+		UserID: userID, CookieID: cookieID, Title: title, Description: description,
+		PriceCents: priceCents, OriginalPriceCents: origCents, Quantity: quantity,
+		PostageMode: postageMode, PostageCents: postageCents, Location: applicationLocation, Images: applicationImages,
+	})
+	// res 用于本次流程后续判断的响应
+	res := outcome.Result
 	if callErr != nil {
-		if responseCookieErr != nil {
-			callErr = errors.Join(callErr, fmt.Errorf("保存发布响应 Cookie: %w", responseCookieErr))
+		// perr 用于本次流程后续判断的perr
+		var perr *itemapp.PublishError
+		if errors.As(callErr, &perr) {
+			// status 用于本次流程后续判断的状态
+			status := http.StatusBadGateway
+			// msg 用于本次流程后续判断的msg
+			msg := perr.Error()
+			if perr.Code == itemapp.PublishErrorStockPermissionMissing {
+				status = http.StatusForbidden
+				msg = "该账号没有库存发布权限，无法按库存数量发布商品"
+			}
+			writeErrCode(w, status, string(perr.Code), msg, "")
+			return
 		}
-		// Session 失效是账号级凭证问题。续期成功后，当前发布请求仍然
-		// 可以安全重试一次：平台已经明确拒绝了这次业务调用，不会把
-		// 同一商品重复发布。重试前重新读取 Cookie，避免继续使用旧会话。
-		if mtop.IsSessionExpiredErr(callErr) && s.recoverExpiredMTOPSession(r.Context(), cookieID, callErr) {
-			retryRes, retryErr, retryCookieErr, credentialChanged := s.retryPublishItemAfterRenewal(ctx, cookieID, userID, publishReq)
-			if credentialChanged {
-				writeErr(w, http.StatusConflict, "账号凭证已变化，请重试")
-				return
-			}
-			if retryErr == nil && retryRes != nil {
-				res = retryRes
-				callErr = nil
-				responseCookieErr = retryCookieErr
-			} else if retryErr != nil {
-				callErr = retryErr
-				responseCookieErr = retryCookieErr
-			}
-		}
-		if callErr == nil {
-			// The renewed attempt succeeded; continue through the normal local
-			// persistence and success response path below.
-		} else {
-			var perr *mtop.PublishError
-			if errors.As(callErr, &perr) {
-				status := http.StatusBadGateway
-				msg := perr.Error()
-				if perr.Code == mtop.PublishErrorStockPermissionMissing {
-					status = http.StatusForbidden
-					msg = "该账号没有库存发布权限，无法按库存数量发布商品"
-				}
-				writeJSON(w, status, map[string]any{
-					"success": false,
-					"code":    perr.Code,
-					"message": msg,
-					"ret":     perr.Ret,
-				})
-				return
-			}
-			writeErr(w, http.StatusBadGateway, callErr.Error())
+		if strings.Contains(callErr.Error(), "账号凭证已变化") {
+			writeErr(w, http.StatusConflict, callErr.Error())
 			return
 		}
 	}
 	if res == nil || strings.TrimSpace(res.ItemID) == "" {
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"success": false,
-			"code":    "publish_result_missing_item_id",
-			"message": "平台返回发布成功，但缺少商品 ID，无法确认发布结果",
-		})
+		writeErrCode(w, http.StatusBadGateway, "publish_result_missing_item_id", "平台返回发布成功，但缺少商品 ID，无法确认发布结果", "")
 		return
 	}
-	detail := map[string]any{
-		"item_image":    res.ImageURL,
-		"web_url":       res.ItemURL,
-		"category_name": res.CategoryName,
-		"quantity":      res.Quantity,
-		"publish_raw":   res.RawData,
-	}
-	detailJSON, _ := json.Marshal(detail)
-	if err := s.Store.Items.Upsert(r.Context(), &db.ItemInfoRow{
-		CookieID:              cookieID,
-		ItemID:                res.ItemID,
-		ItemTitle:             res.Title,
-		ItemDescription:       description,
-		ItemCategory:          res.CategoryID,
-		ItemPrice:             res.PriceText,
-		ItemDetail:            string(detailJSON),
-		MultiQuantityDelivery: quantity > 1,
-	}); err != nil {
+	if outcome.LocalSaveErr != nil {
 		if s.Logger != nil {
-			s.Logger.Error("平台已发布但保存本地商品失败", "cookie_id", cookieID, "item_id", res.ItemID, "err", err)
+			s.Logger.Error("平台已发布但保存本地商品失败", "cookie_id", cookieID, "item_id", res.ItemID, "err", outcome.LocalSaveErr)
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"success":  false,
-			"code":     "remote_published_local_save_failed",
-			"message":  "商品已在平台发布，但本地保存失败，请勿重复发布并根据商品 ID 人工核对",
-			"item_id":  res.ItemID,
-			"item_url": res.ItemURL,
-		})
+		writeErrDetails(w, http.StatusInternalServerError, "remote_published_local_save_failed", "商品已在平台发布，但本地保存失败，请勿重复发布并根据商品 ID 人工核对", "", map[string]any{"item_id": res.ItemID, "item_url": res.ItemURL})
 		return
 	}
-	if responseCookieErr != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"success":  false,
-			"code":     "remote_published_cookie_save_failed",
-			"message":  "商品已在平台发布并保存到本地，但登录凭证更新保存失败，请勿重复发布并尽快重新登录",
-			"item_id":  res.ItemID,
-			"item_url": res.ItemURL,
-		})
+	if outcome.ResponseCookieErr != nil {
+		writeErrDetails(w, http.StatusInternalServerError, "remote_published_cookie_save_failed", "商品已在平台发布并保存到本地，但登录凭证更新保存失败，请勿重复发布并尽快重新登录", "", map[string]any{"item_id": res.ItemID, "item_url": res.ItemURL})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"success":       true,
-		"message":       "商品发布成功",
-		"item_id":       res.ItemID,
-		"item_url":      res.ItemURL,
-		"item_image":    res.ImageURL,
-		"item_title":    res.Title,
-		"item_price":    res.PriceText,
-		"quantity":      res.Quantity,
-		"category_id":   res.CategoryID,
-		"category_name": res.CategoryName,
+	writeJSON(w, http.StatusOK, itemPublishResponse{
+		Success: true, Message: "商品发布成功", ItemID: res.ItemID, ItemURL: res.ItemURL,
+		ItemImage: res.ImageURL, ItemTitle: res.Title, ItemPrice: res.PriceText, Quantity: res.Quantity,
+		CategoryID: res.CategoryID, CategoryName: res.CategoryName,
 	})
 }
 
-// retryPublishItemAfterRenewal re-reads the account credential after a
-// successful Session renewal and repeats one rejected publish attempt. The
-// caller already owns the parsed images and request payload, so this method
-// deliberately does not re-parse the multipart body.
-func (s *Server) retryPublishItemAfterRenewal(
-	ctx context.Context,
-	cookieID string,
-	userID int64,
-	req mtop.PublishItemRequest,
-) (result *mtop.PublishItemResult, callErr, cookieErr error, credentialChanged bool) {
-	credentialUnlock := s.Store.LockAccountCredentials(cookieID)
-	defer credentialUnlock()
-	latest, err := s.Store.Cookies.GetDetails(ctx, cookieID)
-	if err != nil || latest == nil || latest.UserID != userID || !hasStoredCookieCredential(latest) {
-		return nil, nil, nil, true
-	}
-	cookieValue := latest.Value
-	mtopCtx, cookieSession := withMTopCookieSnapshot(ctx, latest)
-	result, callErr = s.mtopClient().PublishItem(mtopCtx, cookieValue, req)
-	value, valueChanged, handled, persistErr := s.persistMTopCookieSessionLocked(ctx, latest, cookieSession)
-	if persistErr != nil {
-		cookieErr = persistErr
-		if s.Logger != nil {
-			s.Logger.Error("保存重试发布响应 Cookie Jar 失败", "cookie_id", cookieID, "err", persistErr)
-		}
-	} else if handled {
-		if valueChanged {
-			s.updateRunningCookie(ctx, cookieID, value)
-		}
-	} else if callErr == nil && result != nil && result.UpdatedCookies != "" && result.UpdatedCookies != cookieValue {
-		if err := s.Store.Cookies.UpdateValueOwned(ctx, cookieID, result.UpdatedCookies, userID); err != nil {
-			cookieErr = err
-			if s.Logger != nil {
-				s.Logger.Error("保存重试发布响应 Cookie 失败", "cookie_id", cookieID, "err", err)
-			}
-		} else {
-			s.updateRunningCookie(ctx, cookieID, result.UpdatedCookies)
-		}
-	}
-	if cookieErr != nil && callErr != nil {
-		callErr = errors.Join(callErr, fmt.Errorf("保存发布响应 Cookie: %w", cookieErr))
-	}
-	return result, callErr, cookieErr, false
-}
-
-func readPublishImages(r *http.Request, maxImages int) ([]mtop.PublishImage, error) {
+// readPublishImages 封装read发布Images业务协调。
+func readPublishImages(r *http.Request, maxImages int) ([]itemapp.Image, error) {
 	if r.MultipartForm == nil || r.MultipartForm.File == nil {
 		return nil, errors.New("至少上传 1 张商品图片")
 	}
+	// files 用于本次流程后续判断的文件列表
 	files := r.MultipartForm.File["images"]
 	if len(files) == 0 {
 		files = r.MultipartForm.File["image"]
@@ -315,12 +189,16 @@ func readPublishImages(r *http.Request, maxImages int) ([]mtop.PublishImage, err
 	if len(files) > maxImages {
 		return nil, fmt.Errorf("商品图片最多 %d 张", maxImages)
 	}
-	images := make([]mtop.PublishImage, 0, len(files))
+	// images 用于本次流程后续判断的images
+	images := make([]itemapp.Image, 0, len(files))
+	// fh 表示当前遍历过程中的fh
 	for _, fh := range files {
+		// f、err 用于本次流程后续判断的f、err
 		f, err := fh.Open()
 		if err != nil {
 			return nil, fmt.Errorf("读取图片失败: %w", err)
 		}
+		// data、tooLarge、err 用于本次流程后续判断的data、tooLarge、err
 		data, tooLarge, err := readLimitedBytes(f, 10<<20)
 		_ = f.Close()
 		if err != nil {
@@ -332,6 +210,7 @@ func readPublishImages(r *http.Request, maxImages int) ([]mtop.PublishImage, err
 		if len(data) == 0 {
 			return nil, errors.New("图片文件为空")
 		}
+		// contentType 用于本次流程后续判断的内容类型
 		contentType := fh.Header.Get("Content-Type")
 		if contentType == "" {
 			contentType = http.DetectContentType(data)
@@ -339,11 +218,12 @@ func readPublishImages(r *http.Request, maxImages int) ([]mtop.PublishImage, err
 		if !strings.HasPrefix(contentType, "image/") {
 			return nil, errors.New("只能上传图片文件")
 		}
-		images = append(images, mtop.PublishImage{Filename: fh.Filename, ContentType: contentType, Data: data})
+		images = append(images, itemapp.Image{Filename: fh.Filename, ContentType: contentType, Data: data})
 	}
 	return images, nil
 }
 
+// parseMoneyCents 封装parseMoneyCents业务协调。
 func parseMoneyCents(raw string) (int64, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -351,6 +231,7 @@ func parseMoneyCents(raw string) (int64, error) {
 	}
 	raw = strings.TrimPrefix(raw, "¥")
 	raw = strings.TrimPrefix(raw, "￥")
+	// sign 用于本次流程后续判断的sign
 	sign := int64(1)
 	if strings.HasPrefix(raw, "-") {
 		sign = -1
@@ -358,16 +239,20 @@ func parseMoneyCents(raw string) (int64, error) {
 	} else {
 		raw = strings.TrimPrefix(raw, "+")
 	}
+	// parts 用于本次流程后续判断的parts
 	parts := strings.Split(raw, ".")
 	if len(parts) > 2 {
 		return 0, fmt.Errorf("金额格式错误")
 	}
+	// yuan、err 用于本次流程后续判断的yuan、err
 	yuan, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
 	if err != nil {
 		return 0, err
 	}
+	// cents 用于本次流程后续判断的cents
 	cents := int64(0)
 	if len(parts) == 2 {
+		// frac 用于本次流程后续判断的frac
 		frac := strings.TrimSpace(parts[1])
 		if len(frac) > 2 {
 			return 0, fmt.Errorf("金额最多支持两位小数")
@@ -383,542 +268,420 @@ func parseMoneyCents(raw string) (int64, error) {
 	return sign * (yuan*100 + cents), nil
 }
 
+// itemPublishLocationRequest 是发布接口接收的发货地 HTTP DTO；平台字段转换由发布应用端口负责。
+type itemPublishLocationRequest struct {
+	// Area 是发货地的区县名称。
+	Area string `json:"area"`
+	// City 是发货地的城市名称。
+	City string `json:"city"`
+	// DivisionID 是平台行政区划标识。
+	DivisionID string `json:"division_id"`
+	// Longitude 是发货地经度。
+	Longitude float64 `json:"longitude"`
+	// Latitude 是发货地纬度。
+	Latitude float64 `json:"latitude"`
+	// POIID 是地图服务返回的兴趣点标识。
+	POIID string `json:"poi_id"`
+	// POIName 是地图服务返回的兴趣点名称。
+	POIName string `json:"poi_name"`
+	// Province 是发货地的省份名称。
+	Province string `json:"province"`
+}
+
+// listItems 封装list商品列表业务协调。
 func (s *Server) listItems(w http.ResponseWriter, r *http.Request) {
+	// sess 用于本次流程后续判断的sess
 	sess := auth.SessionFromContext(r.Context())
-	all, err := s.Store.Cookies.AllForUser(r.Context(), sess.UserID)
+	// cookieID 是可选的账号筛选条件。
+	cookieID := strings.TrimSpace(r.URL.Query().Get("cookie_id"))
+	// cookieID 用于本次流程后续判断的登录凭证ID
+	if cookieID != "" {
+		if !s.cookieOwnedByUser(r.Context(), sess.UserID, cookieID) {
+			writeErr(w, http.StatusForbidden, "无权限操作该账号")
+			return
+		}
+	}
+	// items、err 保存应用层商品查询结果及错误。
+	items, err := s.itemCatalogApplication().ListForUser(r.Context(), sess.UserID, cookieID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "查询失败")
 		return
 	}
-	cookieID := strings.TrimSpace(r.URL.Query().Get("cookie_id"))
-	if cookieID != "" {
-		if _, ok := all[cookieID]; !ok {
-			writeErr(w, http.StatusForbidden, "无权限操作该账号")
-			return
-		}
-		all = map[string]string{cookieID: all[cookieID]}
-	}
-	result := []map[string]any{}
-	for cid := range all {
-		items, _ := s.Store.Items.AllForCookie(r.Context(), cid)
-		for _, it := range items {
-			result = append(result, itemToMap(it))
-		}
+	// result 用于本次流程后续判断的结果。
+	result := make([]itemListResponse, 0, len(items))
+	// it 表示当前遍历过程中的商品行。
+	for _, it := range items {
+		result = append(result, itemToMap(it))
 	}
 	writeJSON(w, http.StatusOK, result)
 }
 
+// itemSyncRequest 是商品全量和分页同步接口共用的请求 DTO。
+type itemSyncRequest struct {
+	// CookieID 是待同步的平台账号标识。
+	CookieID string `json:"cookie_id"`
+	// PageNumber 是分页同步的平台页码。
+	PageNumber int `json:"page_number"`
+	// PageSize 是平台单页大小。
+	PageSize int `json:"page_size"`
+	// MaxPages 是全量同步允许读取的最大页数。
+	MaxPages int `json:"max_pages"`
+}
+
+// syncItemsFromAccount 解析请求并调用商品全集同步应用服务。
 func (s *Server) syncItemsFromAccount(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		CookieID string `json:"cookie_id"`
-		PageSize int    `json:"page_size"`
-		MaxPages int    `json:"max_pages"`
-	}
-	if err := decodeJSON(r, &req); err != nil || req.CookieID == "" {
+	// req 保存解码后的商品全集同步请求。
+	var req itemSyncRequest
+	// err 保存商品全集同步请求解码失败的原因。
+	if err := decodeJSON(r, &req); err != nil || strings.TrimSpace(req.CookieID) == "" {
 		writeErr(w, http.StatusBadRequest, "缺少 cookie_id 参数")
 		return
 	}
-	_, userID, ok := s.cookieForCurrentUser(w, r, req.CookieID)
-	if !ok {
-		return
-	}
-	credentialUnlock := s.Store.LockAccountCredentials(req.CookieID)
-	latest, err := s.Store.Cookies.GetDetails(r.Context(), req.CookieID)
-	if err != nil || latest == nil || latest.UserID != userID || !hasStoredCookieCredential(latest) {
-		credentialUnlock()
-		writeErr(w, http.StatusConflict, "账号凭证已变化，请重试")
-		return
-	}
-	cookieValue := latest.Value
-	if req.PageSize <= 0 {
-		req.PageSize = 20
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-	defer cancel()
-	client := s.mtopClient()
-	mtopCtx, cookieSession := withMTopCookieSnapshot(ctx, latest)
-	res, callErr := client.FetchAllItems(mtopCtx, cookieValue, req.PageSize, req.MaxPages)
-	if callErr == nil && res == nil {
-		callErr = errors.New("商品列表接口未返回结果")
-	}
-	if callErr != nil {
-		value, valueChanged, _, persistErr := s.persistMTopCookieSessionLocked(r.Context(), latest, cookieSession)
-		credentialUnlock()
-		if persistErr != nil {
-			s.Logger.Error("保存商品同步响应 Cookie Jar 失败", "cookie_id", req.CookieID, "err", persistErr)
-			writeErr(w, http.StatusInternalServerError, "商品同步响应凭证保存失败")
-			return
-		} else if valueChanged {
-			s.updateRunningCookie(r.Context(), req.CookieID, value)
-		}
-		s.recoverExpiredMTOPSession(r.Context(), req.CookieID, callErr)
-		writeErr(w, http.StatusBadGateway, callErr.Error())
-		return
-	}
-	detailCookies := cookieValue
-	if res.UpdatedCookies != "" {
-		detailCookies = res.UpdatedCookies
-	}
-	detailErr := s.enrichSyncedItemMultiSpec(mtopCtx, client, detailCookies, req.CookieID, res.Items)
-	runtimeCookie := ""
-	runtimeCookieChanged := false
-	value, valueChanged, handled, persistErr := s.persistMTopCookieSessionLocked(r.Context(), latest, cookieSession)
-	if persistErr != nil {
-		s.Logger.Error("保存商品同步响应 Cookie Jar 失败", "cookie_id", req.CookieID, "err", persistErr)
-		credentialUnlock()
-		writeErr(w, http.StatusInternalServerError, "商品同步响应凭证保存失败")
-		return
-	} else if handled {
-		if valueChanged {
-			runtimeCookie = value
-			runtimeCookieChanged = true
-		}
-	} else if res.UpdatedCookies != "" && res.UpdatedCookies != cookieValue {
-		if saveErr := s.Store.Cookies.UpdateValueOwned(r.Context(), req.CookieID, res.UpdatedCookies, userID); saveErr != nil {
-			s.Logger.Error("保存刷新后的 cookie 失败", "cookie_id", req.CookieID, "err", saveErr)
-			credentialUnlock()
-			writeErr(w, http.StatusInternalServerError, "商品同步响应凭证保存失败")
-			return
-		} else {
-			runtimeCookie = res.UpdatedCookies
-			runtimeCookieChanged = true
-		}
-	}
-	credentialUnlock()
-	if runtimeCookieChanged {
-		s.updateRunningCookie(r.Context(), req.CookieID, runtimeCookie)
-	}
-	if detailErr != nil {
-		s.recoverExpiredMTOPSession(r.Context(), req.CookieID, detailErr)
-		writeErr(w, http.StatusBadGateway, detailErr.Error())
-		return
-	}
-	syncResult, syncErr := s.syncSyncedItems(r.Context(), req.CookieID, res.Items)
-	if syncErr != nil {
-		if s.Logger != nil {
-			s.Logger.Error("同步商品到本地失败", "cookie_id", req.CookieID, "err", syncErr)
-		}
-		writeErr(w, http.StatusInternalServerError, "保存商品同步结果失败")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"success":       true,
-		"message":       "成功获取商品，共 " + strconv.Itoa(len(res.Items)) + " 件，保存 " + strconv.Itoa(syncResult.Saved) + " 件，删除 " + strconv.Itoa(syncResult.Deleted) + " 件",
-		"total_count":   len(res.Items),
-		"total_pages":   res.TotalPages,
-		"saved_count":   syncResult.Saved,
-		"deleted_count": syncResult.Deleted,
-	})
-}
-
-func (s *Server) syncItemsPageFromAccount(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		CookieID   string `json:"cookie_id"`
-		PageNumber int    `json:"page_number"`
-		PageSize   int    `json:"page_size"`
-	}
-	if err := decodeJSON(r, &req); err != nil || req.CookieID == "" {
-		writeErr(w, http.StatusBadRequest, "缺少 cookie_id 参数")
-		return
-	}
-	_, userID, ok := s.cookieForCurrentUser(w, r, req.CookieID)
-	if !ok {
-		return
-	}
-	credentialUnlock := s.Store.LockAccountCredentials(req.CookieID)
-	latest, err := s.Store.Cookies.GetDetails(r.Context(), req.CookieID)
-	if err != nil || latest == nil || latest.UserID != userID || !hasStoredCookieCredential(latest) {
-		credentialUnlock()
-		writeErr(w, http.StatusConflict, "账号凭证已变化，请重试")
-		return
-	}
-	cookieValue := latest.Value
-	ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
-	defer cancel()
-	client := s.mtopClient()
-	mtopCtx, cookieSession := withMTopCookieSnapshot(ctx, latest)
-	res, callErr := client.FetchItemsPage(mtopCtx, cookieValue, req.PageNumber, req.PageSize)
-	if callErr == nil && res == nil {
-		callErr = errors.New("商品列表接口未返回结果")
-	}
-	if callErr != nil {
-		value, valueChanged, _, persistErr := s.persistMTopCookieSessionLocked(r.Context(), latest, cookieSession)
-		credentialUnlock()
-		if persistErr != nil {
-			s.Logger.Error("保存商品分页响应 Cookie Jar 失败", "cookie_id", req.CookieID, "err", persistErr)
-			writeErr(w, http.StatusInternalServerError, "商品分页响应凭证保存失败")
-			return
-		} else if valueChanged {
-			s.updateRunningCookie(r.Context(), req.CookieID, value)
-		}
-		s.recoverExpiredMTOPSession(r.Context(), req.CookieID, callErr)
-		writeErr(w, http.StatusBadGateway, callErr.Error())
-		return
-	}
-	detailCookies := cookieValue
-	if res.UpdatedCookies != "" {
-		detailCookies = res.UpdatedCookies
-	}
-	detailErr := s.enrichSyncedItemMultiSpec(mtopCtx, client, detailCookies, req.CookieID, res.Items)
-	runtimeCookie := ""
-	runtimeCookieChanged := false
-	value, valueChanged, handled, persistErr := s.persistMTopCookieSessionLocked(r.Context(), latest, cookieSession)
-	if persistErr != nil {
-		s.Logger.Error("保存商品分页响应 Cookie Jar 失败", "cookie_id", req.CookieID, "err", persistErr)
-		credentialUnlock()
-		writeErr(w, http.StatusInternalServerError, "商品分页响应凭证保存失败")
-		return
-	} else if handled {
-		if valueChanged {
-			runtimeCookie = value
-			runtimeCookieChanged = true
-		}
-	} else if res.UpdatedCookies != "" && res.UpdatedCookies != cookieValue {
-		if saveErr := s.Store.Cookies.UpdateValueOwned(r.Context(), req.CookieID, res.UpdatedCookies, userID); saveErr != nil {
-			s.Logger.Error("保存刷新后的 cookie 失败", "cookie_id", req.CookieID, "err", saveErr)
-			credentialUnlock()
-			writeErr(w, http.StatusInternalServerError, "商品分页响应凭证保存失败")
-			return
-		} else {
-			runtimeCookie = res.UpdatedCookies
-			runtimeCookieChanged = true
-		}
-	}
-	credentialUnlock()
-	if runtimeCookieChanged {
-		s.updateRunningCookie(r.Context(), req.CookieID, runtimeCookie)
-	}
-	if detailErr != nil {
-		s.recoverExpiredMTOPSession(r.Context(), req.CookieID, detailErr)
-		writeErr(w, http.StatusBadGateway, detailErr.Error())
-		return
-	}
-	saved := s.saveSyncedItems(r.Context(), req.CookieID, res.Items)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"success":       true,
-		"message":       "成功获取第" + strconv.Itoa(res.PageNumber) + "页 " + strconv.Itoa(len(res.Items)) + " 个商品",
-		"page_number":   res.PageNumber,
-		"page_size":     res.PageSize,
-		"current_count": len(res.Items),
-		"saved_count":   saved,
-	})
-}
-
-func (s *Server) cookieForCurrentUser(w http.ResponseWriter, r *http.Request, cookieID string) (string, int64, bool) {
+	// sess 保存认证中间件提供的当前用户会话。
 	sess := auth.SessionFromContext(r.Context())
-	all, err := s.Store.Cookies.AllForUser(r.Context(), sess.UserID)
+	// result、err 保存应用服务返回的全集同步结果及错误。
+	result, err := s.itemSyncApplication().SyncAll(r.Context(), itemapp.SyncQuery{UserID: sess.UserID, CookieID: req.CookieID, PageSize: req.PageSize, MaxPages: req.MaxPages})
 	if err != nil {
+		s.writeItemSyncError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, itemSyncResponse{Success: true, Message: "成功获取商品，共 " + strconv.Itoa(result.TotalCount) + " 件，保存 " + strconv.Itoa(result.SavedCount) + " 件，删除 " + strconv.Itoa(result.DeletedCount) + " 件", TotalCount: result.TotalCount, TotalPages: result.TotalPages, SavedCount: result.SavedCount, DeletedCount: result.DeletedCount})
+}
+
+// syncItemsPageFromAccount 解析请求并调用商品分页同步应用服务。
+func (s *Server) syncItemsPageFromAccount(w http.ResponseWriter, r *http.Request) {
+	// req 保存解码后的商品分页同步请求。
+	var req itemSyncRequest
+	// err 保存商品分页同步请求解码失败的原因。
+	if err := decodeJSON(r, &req); err != nil || strings.TrimSpace(req.CookieID) == "" {
+		writeErr(w, http.StatusBadRequest, "缺少 cookie_id 参数")
+		return
+	}
+	// sess 保存认证中间件提供的当前用户会话。
+	sess := auth.SessionFromContext(r.Context())
+	// result、err 保存应用服务返回的分页同步结果及错误。
+	result, err := s.itemSyncApplication().SyncPage(r.Context(), itemapp.SyncQuery{UserID: sess.UserID, CookieID: req.CookieID, PageNumber: req.PageNumber, PageSize: req.PageSize})
+	if err != nil {
+		s.writeItemSyncError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, itemPageSyncResponse{Success: true, Message: "成功获取第" + strconv.Itoa(result.PageNumber) + "页 " + strconv.Itoa(result.CurrentCount) + " 个商品", PageNumber: result.PageNumber, PageSize: result.PageSize, CurrentCount: result.CurrentCount, SavedCount: result.SavedCount})
+}
+
+// writeItemSyncError 将应用同步错误映射为稳定的 HTTP 状态和消息。
+func (s *Server) writeItemSyncError(w http.ResponseWriter, err error) {
+	if errors.Is(err, itemapp.ErrSyncNotOwned) {
+		writeErr(w, http.StatusForbidden, "无权限操作该账号")
+		return
+	}
+	if errors.Is(err, itemapp.ErrSyncInvalidUser) || errors.Is(err, itemapp.ErrSyncInvalidCookie) {
+		writeErr(w, http.StatusBadRequest, "缺少 cookie_id 参数")
+		return
+	}
+	// stageErr 保存应用服务提供的同步阶段错误。
+	var stageErr *itemapp.SyncError
+	if errors.As(err, &stageErr) {
+		switch stageErr.Kind {
+		case itemapp.SyncErrorCredential:
+			writeErr(w, http.StatusConflict, "账号凭证已变化，请重试")
+		case itemapp.SyncErrorPersistence:
+			writeErr(w, http.StatusInternalServerError, "保存商品同步结果失败")
+		default:
+			writeErr(w, http.StatusBadGateway, stageErr.Error())
+		}
+		return
+	}
+	writeErr(w, http.StatusInternalServerError, "商品同步失败")
+}
+
+// cookieForCurrentUser 封装登录凭证ForCurrent用户业务协调。
+func (s *Server) cookieForCurrentUser(w http.ResponseWriter, r *http.Request, cookieID string) (string, int64, bool) {
+	// sess 用于本次流程后续判断的sess
+	sess := auth.SessionFromContext(r.Context())
+	// service 提供消费者定义的平台凭证只读端口；本校验不会把 Cookie 明文带入 HTTP 层。
+	service := s.platformCredentialApplication()
+	if service == nil {
 		writeErr(w, http.StatusInternalServerError, "查询账号失败")
 		return "", 0, false
 	}
-	value, ok := all[cookieID]
-	if !ok {
-		writeErr(w, http.StatusForbidden, "无权限操作该账号")
-		return "", 0, false
-	}
-	if value == "" {
-		writeErr(w, http.StatusBadRequest, "账号 cookie 为空")
+	// value、err 保存已完成归属复核的平台 Cookie 及校验错误；明文只交给当前平台调用链。
+	value, err := service.LoadOwnedValue(r.Context(), sess.UserID, cookieID)
+	if err != nil {
+		if errors.Is(err, accountapp.ErrCredentialNotFound) || errors.Is(err, accountapp.ErrForbidden) {
+			writeErr(w, http.StatusForbidden, "无权限操作该账号")
+			return "", 0, false
+		}
+		if errors.Is(err, accountapp.ErrCredentialEmpty) {
+			writeErr(w, http.StatusBadRequest, "账号 cookie 为空")
+			return "", 0, false
+		}
+		writeErr(w, http.StatusInternalServerError, "查询账号失败")
 		return "", 0, false
 	}
 	return value, sess.UserID, true
 }
 
-func (s *Server) saveSyncedItems(ctx context.Context, cookieID string, items []mtop.ItemListItem) int {
-	saved := 0
-	for _, item := range items {
-		priceText := item.PriceText
-		if priceText == "" {
-			priceText = item.Price
-		}
-		err := s.Store.Items.UpsertBasic(ctx, &db.ItemInfoRow{
-			CookieID:        cookieID,
-			ItemID:          item.ID,
-			ItemTitle:       item.Title,
-			ItemDescription: "",
-			ItemCategory:    item.CategoryID,
-			ItemPrice:       priceText,
-			ItemDetail:      item.ItemDetail,
-		})
-		if err == nil {
-			if item.IsMultiSpec {
-				if multiErr := s.Store.Items.SetMultiSpec(ctx, cookieID, item.ID, true); multiErr != nil && s.Logger != nil {
-					s.Logger.Warn("保存商品多规格状态失败", "cookie_id", cookieID, "item_id", item.ID, "err", multiErr)
-				}
-			}
-			saved++
-		} else if s.Logger != nil {
-			s.Logger.Warn("保存商品失败", "cookie_id", cookieID, "item_id", item.ID, "err", err)
-		}
-	}
-	return saved
-}
-
-func (s *Server) syncSyncedItems(ctx context.Context, cookieID string, items []mtop.ItemListItem) (db.ItemSyncResult, error) {
-	rows := make([]db.ItemInfoRow, 0, len(items))
-	for _, item := range items {
-		priceText := item.PriceText
-		if priceText == "" {
-			priceText = item.Price
-		}
-		rows = append(rows, db.ItemInfoRow{
-			CookieID:     cookieID,
-			ItemID:       item.ID,
-			ItemTitle:    item.Title,
-			ItemCategory: item.CategoryID,
-			ItemPrice:    priceText,
-			ItemDetail:   item.ItemDetail,
-			IsMultiSpec:  item.IsMultiSpec,
-		})
-	}
-	return s.Store.Items.SyncFromRemote(ctx, cookieID, rows)
-}
-
-func (s *Server) enrichSyncedItemMultiSpec(ctx context.Context, client mtop.Client, cookies, cookieID string, items []mtop.ItemListItem) error {
-	fetcher, ok := client.(mtop.ItemDetailFetcher)
-	if !ok {
-		return nil
-	}
-	for index := range items {
-		if items[index].IsMultiSpec || s.Store.Items.IsMultiSpec(ctx, cookieID, items[index].ID) {
-			items[index].IsMultiSpec = true
-			continue
-		}
-		isMultiSpec, err := fetcher.DetectItemMultiSpec(ctx, cookies, items[index].ID)
-		if err != nil {
-			if mtop.IsSessionExpiredErr(err) {
-				return err
-			}
-			if s.Logger != nil {
-				s.Logger.Warn("识别商品多规格状态失败", "cookie_id", cookieID, "item_id", items[index].ID, "err", err)
-			}
-			continue
-		}
-		items[index].IsMultiSpec = isMultiSpec
-	}
-	return nil
-}
-
+// listItemsByCookie 封装list商品列表By登录凭证业务协调。
 func (s *Server) listItemsByCookie(w http.ResponseWriter, r *http.Request) {
+	// cid 用于本次流程后续判断的cid
 	cid := chi.URLParam(r, "cookie_id")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	if !s.requireCookieOwnership(w, r, cid) {
 		return
 	}
-	items, err := s.Store.Items.AllForCookie(r.Context(), cid)
+	// items、err 保存应用层商品查询结果及错误。
+	items, err := s.itemCatalogApplication().ListByCookie(r.Context(), cid)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "查询失败")
 		return
 	}
-	out := make([]map[string]any, 0, len(items))
+	// out 用于本次流程后续判断的out
+	out := make([]itemListResponse, 0, len(items))
+	// it 表示当前遍历过程中的it
 	for _, it := range items {
 		out = append(out, itemToMap(it))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
+// getItem 封装get商品业务协调。
 func (s *Server) getItem(w http.ResponseWriter, r *http.Request) {
+	// cid 用于本次流程后续判断的cid
 	cid := chi.URLParam(r, "cookie_id")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	if !s.requireCookieOwnership(w, r, cid) {
 		return
 	}
+	// itemID 用于本次流程后续判断的商品ID
 	itemID := chi.URLParam(r, "item_id")
-	it, err := s.Store.Items.Get(r.Context(), cid, itemID)
+	// it、err 用于本次流程后续判断的it、err
+	it, err := s.itemCatalogApplication().Get(r.Context(), cid, itemID)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "商品不存在")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"cookie_id": it.CookieID, "item_id": it.ItemID, "item_title": it.ItemTitle,
-		"item_description": it.ItemDescription, "item_category": it.ItemCategory,
-		"item_price": it.ItemPrice, "item_detail": it.ItemDetail,
-		"is_multi_spec": it.IsMultiSpec, "multi_quantity_delivery": it.MultiQuantityDelivery,
+	writeJSON(w, http.StatusOK, itemDetailResponse{
+		CookieID: it.CookieID, ItemID: it.ItemID, ItemTitle: it.ItemTitle, ItemDescription: it.ItemDescription,
+		ItemCategory: it.ItemCategory, ItemPrice: it.ItemPrice, ItemDetail: it.ItemDetail,
+		IsMultiSpec: it.IsMultiSpec, MultiQuantityDelivery: it.MultiQuantityDelivery,
 	})
 }
 
+// itemCreateRequest 是创建本地商品接口的请求 DTO。
+type itemCreateRequest struct {
+	// ItemID 是平台商品标识。
+	ItemID string `json:"item_id"`
+	// ItemTitle 是商品标题。
+	ItemTitle string `json:"item_title"`
+	// ItemDescription 是商品描述。
+	ItemDescription string `json:"item_description"`
+	// ItemCategory 是平台商品类目标识。
+	ItemCategory string `json:"item_category"`
+	// ItemPrice 是商品价格文本。
+	ItemPrice string `json:"item_price"`
+	// ItemDetail 是商品扩展详情 JSON。
+	ItemDetail string `json:"item_detail"`
+	// IsMultiSpec 表示是否启用多规格交付。
+	IsMultiSpec bool `json:"is_multi_spec"`
+	// MultiQuantityDelivery 表示是否启用多数量交付。
+	MultiQuantityDelivery bool `json:"multi_quantity_delivery"`
+	// IsMultiQtyShip 是历史客户端使用的多数量交付别名。
+	IsMultiQtyShip bool `json:"is_multi_qty_ship"`
+}
+
+// itemUpdateRequest 是局部更新本地商品接口的请求 DTO。
+type itemUpdateRequest struct {
+	// ItemTitle 是可选的商品标题。
+	ItemTitle *string `json:"item_title"`
+	// ItemDescription 是可选的商品描述。
+	ItemDescription *string `json:"item_description"`
+	// ItemCategory 是可选的商品类目标识。
+	ItemCategory *string `json:"item_category"`
+	// ItemPrice 是可选的商品价格文本。
+	ItemPrice *string `json:"item_price"`
+	// ItemDetail 是可选的商品扩展详情 JSON。
+	ItemDetail *string `json:"item_detail"`
+	// IsMultiSpec 是可选的多规格交付开关。
+	IsMultiSpec *bool `json:"is_multi_spec"`
+	// MultiQuantityDelivery 是可选的多数量交付开关。
+	MultiQuantityDelivery *bool `json:"multi_quantity_delivery"`
+	// IsMultiQtyShip 是历史客户端使用的多数量交付开关别名。
+	IsMultiQtyShip *bool `json:"is_multi_qty_ship"`
+}
+
+// itemMultiSpecRequest 是更新商品多规格开关的请求 DTO。
+type itemMultiSpecRequest struct {
+	// IsMultiSpec 表示是否启用多规格交付。
+	IsMultiSpec bool `json:"is_multi_spec"`
+}
+
+// itemMultiQuantityRequest 是更新商品多数量交付开关的请求 DTO。
+type itemMultiQuantityRequest struct {
+	// MultiQuantityDelivery 表示是否启用多数量交付。
+	MultiQuantityDelivery bool `json:"multi_quantity_delivery"`
+}
+
+// createItem 创建本地商品记录并返回统一操作结果。
 func (s *Server) createItem(w http.ResponseWriter, r *http.Request) {
+	// cid 用于本次流程后续判断的cid
 	cid := chi.URLParam(r, "cookie_id")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	if !s.requireCookieOwnership(w, r, cid) {
 		return
 	}
-	var req struct {
-		ItemID                string `json:"item_id"`
-		ItemTitle             string `json:"item_title"`
-		ItemDescription       string `json:"item_description"`
-		ItemCategory          string `json:"item_category"`
-		ItemPrice             string `json:"item_price"`
-		ItemDetail            string `json:"item_detail"`
-		IsMultiSpec           bool   `json:"is_multi_spec"`
-		MultiQuantityDelivery bool   `json:"multi_quantity_delivery"`
-		IsMultiQtyShip        bool   `json:"is_multi_qty_ship"`
-	}
-	if err := decodeJSON(r, &req); err != nil || req.ItemID == "" {
+	// req 保存解码后的创建商品请求。
+	var req itemCreateRequest
+	if // err 用于本次流程后续判断的err
+	err := decodeJSON(r, &req); err != nil || req.ItemID == "" {
 		writeErr(w, http.StatusBadRequest, "缺少商品 ID")
 		return
 	}
 	if req.MultiQuantityDelivery || req.IsMultiQtyShip {
 		req.MultiQuantityDelivery = true
 	}
-	if err := s.Store.Items.Upsert(r.Context(), &db.ItemInfoRow{
-		CookieID: cid, ItemID: req.ItemID, ItemTitle: req.ItemTitle, ItemDescription: req.ItemDescription,
+	// err 保存商品创建应用服务返回的错误。
+	if err := s.itemCatalogMutationApplication().Create(r.Context(), cid, itemapp.CatalogWriteInput{
+		ItemID: req.ItemID, ItemTitle: req.ItemTitle, ItemDescription: req.ItemDescription,
 		ItemCategory: req.ItemCategory, ItemPrice: req.ItemPrice, ItemDetail: req.ItemDetail,
 		IsMultiSpec: req.IsMultiSpec, MultiQuantityDelivery: req.MultiQuantityDelivery,
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "新增失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	writeJSON(w, http.StatusOK, operationResponse{Success: true})
 }
 
+// updateItem 更新本地商品的部分字段并保留未提交字段。
 func (s *Server) updateItem(w http.ResponseWriter, r *http.Request) {
+	// cid 用于本次流程后续判断的cid
 	cid := chi.URLParam(r, "cookie_id")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	if !s.requireCookieOwnership(w, r, cid) {
 		return
 	}
+	// itemID 用于本次流程后续判断的商品ID
 	itemID := chi.URLParam(r, "item_id")
-	var req struct {
-		ItemTitle             *string `json:"item_title"`
-		ItemDescription       *string `json:"item_description"`
-		ItemCategory          *string `json:"item_category"`
-		ItemPrice             *string `json:"item_price"`
-		ItemDetail            *string `json:"item_detail"`
-		IsMultiSpec           *bool   `json:"is_multi_spec"`
-		MultiQuantityDelivery *bool   `json:"multi_quantity_delivery"`
-		IsMultiQtyShip        *bool   `json:"is_multi_qty_ship"`
-	}
-	if err := decodeJSON(r, &req); err != nil {
+	// req 保存解码后的局部更新商品请求。
+	var req itemUpdateRequest
+	if // err 用于本次流程后续判断的err
+	err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	existing, err := s.Store.Items.Get(r.Context(), cid, itemID)
-	if errors.Is(err, db.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "商品不存在")
-		return
-	}
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "更新失败")
-		return
-	}
-	row := &db.ItemInfoRow{
-		CookieID:              cid,
-		ItemID:                itemID,
-		ItemTitle:             existing.ItemTitle,
-		ItemDescription:       existing.ItemDescription,
-		ItemCategory:          existing.ItemCategory,
-		ItemPrice:             existing.ItemPrice,
-		ItemDetail:            existing.ItemDetail,
-		IsMultiSpec:           existing.IsMultiSpec,
-		MultiQuantityDelivery: existing.MultiQuantityDelivery,
-	}
-	if req.ItemTitle != nil {
-		row.ItemTitle = *req.ItemTitle
-	}
-	if req.ItemDescription != nil {
-		row.ItemDescription = *req.ItemDescription
-	}
-	if req.ItemCategory != nil {
-		row.ItemCategory = *req.ItemCategory
-	}
-	if req.ItemPrice != nil {
-		row.ItemPrice = *req.ItemPrice
-	}
-	if req.ItemDetail != nil {
-		row.ItemDetail = *req.ItemDetail
-	}
-	if req.IsMultiSpec != nil {
-		row.IsMultiSpec = *req.IsMultiSpec
-	}
-	if req.MultiQuantityDelivery != nil {
-		row.MultiQuantityDelivery = *req.MultiQuantityDelivery
+	// patch 保存 HTTP DTO 转换后的应用层局部更新输入。
+	patch := itemapp.CatalogPatchInput{
+		ItemTitle: req.ItemTitle, ItemDescription: req.ItemDescription, ItemCategory: req.ItemCategory,
+		ItemPrice: req.ItemPrice, ItemDetail: req.ItemDetail, IsMultiSpec: req.IsMultiSpec,
+		MultiQuantityDelivery: req.MultiQuantityDelivery,
 	}
 	if req.IsMultiQtyShip != nil {
-		row.MultiQuantityDelivery = *req.IsMultiQtyShip
+		patch.MultiQuantityDelivery = req.IsMultiQtyShip
 	}
-	if err := s.Store.Items.Upsert(r.Context(), row); err != nil {
+	// err 保存商品更新应用服务返回的错误。
+	if err := s.itemCatalogMutationApplication().Update(r.Context(), cid, itemID, patch); err != nil {
+		if errors.Is(err, itemapp.ErrCatalogNotFound) {
+			writeErr(w, http.StatusNotFound, "商品不存在")
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "更新失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	writeJSON(w, http.StatusOK, operationResponse{Success: true})
 }
 
+// deleteItem 封装delete商品业务协调。
 func (s *Server) deleteItem(w http.ResponseWriter, r *http.Request) {
+	// cid 用于本次流程后续判断的cid
 	cid := chi.URLParam(r, "cookie_id")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	if !s.requireCookieOwnership(w, r, cid) {
 		return
 	}
+	// itemID 用于本次流程后续判断的商品ID
 	itemID := chi.URLParam(r, "item_id")
-	if err := s.Store.Items.Delete(r.Context(), cid, itemID); err != nil {
+	// err 保存商品删除应用服务返回的错误。
+	if err := s.itemCatalogMutationApplication().Delete(r.Context(), cid, itemID); err != nil {
 		writeErr(w, http.StatusInternalServerError, "删除失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	writeJSON(w, http.StatusOK, operationResponse{Success: true})
 }
 
+// setItemMultiSpec 封装set商品MultiSpec业务协调。
 func (s *Server) setItemMultiSpec(w http.ResponseWriter, r *http.Request) {
+	// cid 用于本次流程后续判断的cid
 	cid := chi.URLParam(r, "cookie_id")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	if !s.requireCookieOwnership(w, r, cid) {
 		return
 	}
+	// itemID 用于本次流程后续判断的商品ID
 	itemID := chi.URLParam(r, "item_id")
-	var req struct {
-		IsMultiSpec bool `json:"is_multi_spec"`
-	}
-	if err := decodeJSON(r, &req); err != nil {
+	// req 保存解码后的多规格开关请求。
+	var req itemMultiSpecRequest
+	if // err 用于本次流程后续判断的err
+	err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	if err := s.Store.Items.SetMultiSpec(r.Context(), cid, itemID, req.IsMultiSpec); err != nil {
+	// err 保存商品多规格应用服务返回的错误。
+	if err := s.itemCatalogMutationApplication().SetMultiSpec(r.Context(), cid, itemID, req.IsMultiSpec); err != nil {
 		writeErr(w, http.StatusInternalServerError, "更新失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	writeJSON(w, http.StatusOK, operationResponse{Success: true})
 }
 
+// setItemMultiQuantity 封装set商品MultiQuantity业务协调。
 func (s *Server) setItemMultiQuantity(w http.ResponseWriter, r *http.Request) {
+	// cid 用于本次流程后续判断的cid
 	cid := chi.URLParam(r, "cookie_id")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	if !s.requireCookieOwnership(w, r, cid) {
 		return
 	}
+	// itemID 用于本次流程后续判断的商品ID
 	itemID := chi.URLParam(r, "item_id")
-	var req struct {
-		MultiQuantityDelivery bool `json:"multi_quantity_delivery"`
-	}
-	if err := decodeJSON(r, &req); err != nil {
+	// req 保存解码后的多数量交付开关请求。
+	var req itemMultiQuantityRequest
+	if // err 用于本次流程后续判断的err
+	err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	if err := s.Store.Items.SetMultiQuantity(r.Context(), cid, itemID, req.MultiQuantityDelivery); err != nil {
+	// err 保存商品多数量应用服务返回的错误。
+	if err := s.itemCatalogMutationApplication().SetMultiQuantity(r.Context(), cid, itemID, req.MultiQuantityDelivery); err != nil {
 		writeErr(w, http.StatusInternalServerError, "更新失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	writeJSON(w, http.StatusOK, operationResponse{Success: true})
 }
 
-func itemToMap(it db.ItemInfoRow) map[string]any {
+func itemToMap(it itemapp.CatalogItem) itemListResponse { // itemToMap 将应用商品模型转换为商品列表 DTO。
 	imageURL := itemImageFromDetail(it.ItemDetail)
-	return map[string]any{
-		"id":        it.ID,
-		"cookie_id": it.CookieID, "item_id": it.ItemID, "item_title": it.ItemTitle,
-		"item_description": it.ItemDescription, "item_category": it.ItemCategory,
-		"item_price": it.ItemPrice, "item_detail": it.ItemDetail,
-		"item_image":    imageURL,
-		"is_multi_spec": it.IsMultiSpec, "multi_quantity_delivery": it.MultiQuantityDelivery,
-		"is_multi_qty_ship": it.MultiQuantityDelivery,
+	return itemListResponse{
+		ID: it.ID, CookieID: it.CookieID, ItemID: it.ItemID, ItemTitle: it.ItemTitle,
+		ItemDescription: it.ItemDescription, ItemCategory: it.ItemCategory, ItemPrice: it.ItemPrice,
+		ItemDetail: it.ItemDetail, ItemImage: imageURL, IsMultiSpec: it.IsMultiSpec,
+		MultiQuantityDelivery: it.MultiQuantityDelivery, IsMultiQtyShip: it.MultiQuantityDelivery,
 	}
 }
 
+// itemImageFromDetail 解析本地商品详情中的主图地址。
+
+// 商品详情解析失败时返回空字符串，保持列表响应可渲染。
 func itemImageFromDetail(detail string) string {
 	if detail == "" {
 		return ""
 	}
+	// m 用于本次流程后续判断的m
 	var m map[string]any
-	if err := json.Unmarshal([]byte(detail), &m); err != nil {
+	if // err 用于本次流程后续判断的err
+	err := json.Unmarshal([]byte(detail), &m); err != nil {
 		return ""
 	}
-	if pic, ok := m["pic_info"].(map[string]any); ok {
-		if url, ok := pic["picUrl"].(string); ok {
+	if // pic、ok 用于本次流程后续判断的pic、ok
+	pic, ok := m["pic_info"].(map[string]any); ok {
+		if // url、ok 用于本次流程后续判断的url、ok
+		url, ok := pic["picUrl"].(string); ok {
 			return url
 		}
 	}
-	if url, ok := m["item_image"].(string); ok {
+	if // url、ok 用于本次流程后续判断的url、ok
+	url, ok := m["item_image"].(string); ok {
 		return url
 	}
 	return ""

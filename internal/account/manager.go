@@ -7,6 +7,7 @@ package account
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -17,6 +18,12 @@ import (
 	"xianyu-go/internal/engine"
 )
 
+// ErrRestartIncomplete 表示账号重启在旧实例收束或新实例启动前被取消或失败，调用方可据此安排重试与状态展示。
+var ErrRestartIncomplete = errors.New("账号重启未完成")
+
+// legacyManagerShutdownTimeout 是兼容无 Context 停止入口时允许等待账号 worker 收束的最长预算。
+const legacyManagerShutdownTimeout = 10 * time.Second
+
 // Manager 管理所有账号运行时。
 type Manager struct {
 	store   *db.Store
@@ -25,14 +32,21 @@ type Manager struct {
 
 	mu       sync.Mutex
 	accounts map[string]*managedAccount
-	runCtx   context.Context
+	// stopping 保存正在执行删除/停止 fencing 的账号，阻止其被并发重新启动。
+	stopping map[string]struct{}
+	// stoppingAll 表示管理器正在执行全量关闭；关闭期间禁止新账号进入运行实例表。
+	stoppingAll bool
+	runCtx      context.Context
 }
 
+// managedAccount 用于本次流程后续判断的managed账号
 type managedAccount struct {
 	cookieID string
 	acc      *engine.Account
 	cancel   context.CancelFunc
 	done     chan struct{} // Run 返回后关闭
+	// stopping 表示该运行实例已经收到停止请求；保持为 true 直到完整收束，防止重启逃逸。
+	stopping bool
 	err      error
 }
 
@@ -46,43 +60,65 @@ func NewManager(store *db.Store, handler engine.Handler, logger *slog.Logger) *M
 		handler:  handler,
 		logger:   logger,
 		accounts: make(map[string]*managedAccount),
+		stopping: make(map[string]struct{}),
 	}
 }
 
 // StartAll 从 DB 加载所有启用的账号并启动。
 // 已禁用的账号不启动；启动失败的账号记录错误但不影响其他账号。
+// StartAll 启动All。
 func (m *Manager) StartAll(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("启动全部账号需要生命周期 Context")
+	}
 	m.mu.Lock()
 	m.runCtx = ctx
 	m.mu.Unlock()
-	// 管理员视角取全部 cookie（userID=0）。
-	all, err := m.store.Cookies.AllForUser(ctx, 0)
+	// credentials 是系统启动视角下已过滤启用状态、仅含 Cookie 的最小凭证集合。
+	credentials, err := m.store.Cookies.ListEnabledRuntimeCredentials(ctx)
 	if err != nil {
 		return fmt.Errorf("加载账号失败: %w", err)
 	}
-	for cookieID, cookieValue := range all {
-		enabled, statusErr := m.store.Cookies.Status(ctx, cookieID)
-		if statusErr != nil {
-			return fmt.Errorf("读取账号 %s 启用状态: %w", cookieID, statusErr)
-		}
-		if !enabled {
-			m.logger.Info("账号已禁用，跳过启动", "account", cookieID)
-			continue
-		}
-		if err := m.Start(ctx, cookieID, cookieValue); err != nil {
-			m.logger.Error("启动账号失败", "account", cookieID, "err", err)
+	// credential 是当前允许启动的账号及其短暂 Cookie 明文，不得离开运行时边界。
+	for _, credential := range credentials {
+		if err := m.Start(ctx, credential.ID, credential.Value); err != nil { // err 表示当前账号运行实例启动失败，但不阻断其他账号。
+			m.logger.Error("启动账号失败", "account", credential.ID, "err", err)
 		}
 	}
 	return nil
 }
 
+/*
+StartAll 只把启用账号交给运行时 supervisor。
+凭证查询由 db repository 负责解密和范围收敛。
+启动失败只记录当前账号错误，继续处理其他账号。
+调用方负责提供进程级生命周期 Context。
+*/
+
 // Start 启动单个账号（若已在运行则跳过；若上次实例已退出则清理后重启）。
 func (m *Manager) Start(ctx context.Context, cookieID, cookieValue string) error {
+	if ctx == nil {
+		return errors.New("启动账号需要生命周期 Context")
+	}
 	m.mu.Lock()
+	if m.stoppingAll {
+		m.mu.Unlock()
+		return fmt.Errorf("账号管理器正在停止")
+	}
+	// stopping 表示当前账号是否已进入删除/停止 fencing。
+	if _, stopping := m.stopping[cookieID]; stopping {
+		m.mu.Unlock()
+		return fmt.Errorf("账号 %s 正在停止", cookieID)
+	}
 	if m.runCtx != nil {
 		ctx = m.runCtx
 	}
-	if ma, ok := m.accounts[cookieID]; ok {
+	if // ma、ok 用于本次流程后续判断的ma、ok
+	ma, ok := m.accounts[cookieID]; ok {
+		if ma.stopping {
+			m.mu.Unlock()
+			return fmt.Errorf("账号 %s 正在停止", cookieID)
+		}
 		// 已存在：若已退出则清理后重启，否则跳过。select 非阻塞，持锁安全。
 		select {
 		case <-ma.done:
@@ -93,6 +129,7 @@ func (m *Manager) Start(ctx context.Context, cookieID, cookieValue string) error
 			return nil
 		}
 	}
+	// acc 用于本次流程后续判断的acc
 	acc := engine.New(engine.Config{
 		CookieID:  cookieID,
 		CookieStr: cookieValue,
@@ -100,7 +137,9 @@ func (m *Manager) Start(ctx context.Context, cookieID, cookieValue string) error
 		Handler:   m.handler,
 		Logger:    m.logger,
 	})
+	// accCtx、cancel 用于本次流程后续判断的accCtx、cancel
 	accCtx, cancel := context.WithCancel(ctx)
+	// ma 用于本次流程后续判断的ma
 	ma := &managedAccount{
 		cookieID: cookieID,
 		acc:      acc,
@@ -112,6 +151,7 @@ func (m *Manager) Start(ctx context.Context, cookieID, cookieValue string) error
 
 	m.logger.Info("启动账号", "account", cookieID)
 	go func() {
+		// err 用于本次流程后续判断的err
 		err := acc.Run(accCtx)
 		m.mu.Lock()
 		ma.err = err
@@ -122,31 +162,77 @@ func (m *Manager) Start(ctx context.Context, cookieID, cookieValue string) error
 	return nil
 }
 
-// Stop 停止单个账号。
-func (m *Manager) Stop(cookieID string) {
+// BeginStopping 建立账号停止 fencing，阻止新的运行实例在删除流程中启动。
+func (m *Manager) BeginStopping(cookieID string) bool {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	// exists 表示当前账号是否已有其他删除流程建立 fencing。
+	if _, exists := m.stopping[cookieID]; exists {
+		return false
+	}
+	m.stopping[cookieID] = struct{}{}
+	return true
+}
+
+// EndStopping 释放账号停止 fencing，供删除成功或失败后的收束路径调用。
+func (m *Manager) EndStopping(cookieID string) {
+	m.mu.Lock()
+	delete(m.stopping, cookieID)
+	m.mu.Unlock()
+}
+
+// Stop 停止单个账号，并兼容不需要错误返回值的旧调用方。
+func (m *Manager) Stop(cookieID string) {
+	// stopCtx、stopCancel 为兼容入口创建受限关闭预算，避免无 Context 调用无限等待账号 goroutine。
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), legacyManagerShutdownTimeout)
+	defer stopCancel()
+	_ = m.StopContext(stopCtx, cookieID)
+}
+
+// StopContext 在 ctx 约束内停止单个账号；超时后保留运行实例记录，避免误报已清理。
+func (m *Manager) StopContext(ctx context.Context, cookieID string) error {
+	if ctx == nil {
+		return errors.New("停止账号需要关闭 Context")
+	}
+	m.mu.Lock()
+	// ma、ok 用于本次流程后续判断的ma、ok
 	ma, ok := m.accounts[cookieID]
+	if ok {
+		// stopping 标记会阻止 Start 在停止上下文超时后重新替换仍可能存活的运行实例。
+		ma.stopping = true
+	}
 	m.mu.Unlock()
 	if !ok {
-		return
+		return nil
 	}
-	ma.acc.Stop()
+	// err 表示账号运行时停止失败或停止等待超时。
+	if err := ma.acc.StopContext(ctx); err != nil {
+		return fmt.Errorf("停止账号 %s 失败: %w", cookieID, err)
+	}
 	ma.cancel()
-	<-ma.done
+	select {
+	case <-ma.done:
+	case <-ctx.Done():
+		return fmt.Errorf("等待账号 %s 运行协程退出失败: %w", cookieID, ctx.Err())
+	}
 	m.mu.Lock()
-	if current := m.accounts[cookieID]; current == ma {
+	if // current 用于本次流程后续判断的current
+	current := m.accounts[cookieID]; current == ma {
 		delete(m.accounts, cookieID)
 	}
 	m.mu.Unlock()
 	m.logger.Info("账号已停止", "account", cookieID)
+	return nil
 }
 
 // GetInstance 跨层获取账号运行时的消息发送句柄（供 HTTP 手动发货等操作）。
 // 返回 automation.MessageSender 接口而非具体 *engine.Account，避免上层
 // 直接依赖 engine 包内部类型；*engine.Account 实现该接口。
+// GetInstance 读取Instance。
 func (m *Manager) GetInstance(cookieID string) (automation.MessageSender, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// ma、ok 用于本次流程后续判断的ma、ok
 	ma, ok := m.accounts[cookieID]
 	if !ok {
 		return nil, false
@@ -161,6 +247,7 @@ func (m *Manager) Sender(cookieID string) (automation.MessageSender, bool) {
 
 // RecoverExpiredCredential 把任意上层 MTOP API 检测到的 Session 失效统一
 // 转交给账号 Handler 的协议续期流程。调用方必须先释放账号凭证锁。
+// RecoverExpiredCredential 封装RecoverExpiredCredential业务协调。
 func (m *Manager) RecoverExpiredCredential(ctx context.Context, cookieID string) bool {
 	if m == nil || m.handler == nil {
 		return false
@@ -172,8 +259,11 @@ func (m *Manager) RecoverExpiredCredential(ctx context.Context, cookieID string)
 func (m *Manager) RuntimeStatuses() map[string]engine.RuntimeStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// statuses 用于本次流程后续判断的statuses
 	statuses := make(map[string]engine.RuntimeStatus, len(m.accounts))
+	// id、ma 表示当前遍历过程中的id、ma
 	for id, ma := range m.accounts {
+		// status 用于本次流程后续判断的状态
 		status := ma.acc.RuntimeStatus()
 		select {
 		case <-ma.done:
@@ -193,26 +283,77 @@ func (m *Manager) RuntimeStatuses() map[string]engine.RuntimeStatus {
 	return statuses
 }
 
-// Restart 重启账号（停后用最新 DB cookie 重启）。
+// Restart 在同一个调用方 Context 内停止旧实例、读取最新 Cookie 并启动新实例。
+// 取消发生在停止前时不改变现有实例；停止后的取消会返回 ErrRestartIncomplete，调用方不得将其视为重启成功。
 func (m *Manager) Restart(ctx context.Context, cookieID string) error {
-	m.Stop(cookieID)
-	d, err := m.store.Cookies.GetDetails(ctx, cookieID)
-	if err != nil {
-		return fmt.Errorf("读取账号详情失败: %w", err)
+	if ctx == nil {
+		return fmt.Errorf("%w: 重启账号需要生命周期 Context", ErrRestartIncomplete)
 	}
-	return m.Start(ctx, cookieID, d.Value)
+	// contextErr 是进入有副作用的停止阶段前检测到的取消或超时原因。
+	if contextErr := ctx.Err(); contextErr != nil {
+		return fmt.Errorf("%w: %w", ErrRestartIncomplete, contextErr)
+	}
+	// stopErr 是旧运行实例在调用方关闭预算内未能完整收束的原因。
+	if stopErr := m.StopContext(ctx, cookieID); stopErr != nil {
+		return fmt.Errorf("%w: 停止旧账号实例失败: %w", ErrRestartIncomplete, stopErr)
+	}
+	// contextErr 是旧实例已停止后、读取敏感 Cookie 前检测到的取消或超时原因。
+	if contextErr := ctx.Err(); contextErr != nil {
+		return fmt.Errorf("%w: %w", ErrRestartIncomplete, contextErr)
+	}
+	// cookieValue 是重启运行实例所需的单值 Cookie 明文，不包含登录密码或账号资料。
+	cookieValue, err := m.store.Cookies.GetValue(ctx, cookieID)
+	if err != nil {
+		return fmt.Errorf("%w: 读取账号详情失败: %w", ErrRestartIncomplete, err)
+	}
+	// contextErr 是启动新实例前检测到的取消或超时原因，避免把已取消调用转换为后台实例。
+	if contextErr := ctx.Err(); contextErr != nil {
+		return fmt.Errorf("%w: %w", ErrRestartIncomplete, contextErr)
+	}
+	// startErr 是读取最新 Cookie 后无法创建新运行实例的原因。
+	if startErr := m.Start(ctx, cookieID, cookieValue); startErr != nil {
+		return fmt.Errorf("%w: 启动新账号实例失败: %w", ErrRestartIncomplete, startErr)
+	}
+	return nil
 }
 
-// StopAll 停止所有运行中的账号，用于进程优雅退出。
+// StopAll 停止所有运行中的账号，用于进程优雅退出，并兼容旧调用方。
 // 先在锁内收集 cookieID 列表再解锁逐个停，避免持锁等待 goroutine 退出。
+// StopAll 停止All。
 func (m *Manager) StopAll() {
+	// stopCtx、stopCancel 为兼容入口创建受限关闭预算，避免进程退出时无限等待账号 worker。
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), legacyManagerShutdownTimeout)
+	defer stopCancel()
+	_ = m.StopAllContext(stopCtx)
+}
+
+// StopAllContext 在同一个关闭上下文内停止所有账号，遇到超时立即返回并保留未完成实例。
+func (m *Manager) StopAllContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("停止全部账号需要关闭 Context")
+	}
 	m.mu.Lock()
+	// stoppingAll 在收集账号前建立全局 fencing，防止并发 Start 把新实例遗漏在本次关闭之外。
+	m.stoppingAll = true
+	// ids 用于本次流程后续判断的ids
 	ids := make([]string, 0, len(m.accounts))
+	// id 表示当前遍历过程中的标识
 	for id := range m.accounts {
 		ids = append(ids, id)
 	}
 	m.mu.Unlock()
+	// id 表示当前遍历过程中的标识
 	for _, id := range ids {
-		m.Stop(id)
+		// err 表示当前账号停止失败或关闭上下文已到期。
+		if err := m.StopContext(ctx, id); err != nil {
+			return err
+		}
 	}
+	m.mu.Lock()
+	// stoppingAll 仅在所有已登记实例收束后解除；超时返回时保留 fencing，供下一次 StopAllContext 重试。
+	if len(m.accounts) == 0 {
+		m.stoppingAll = false
+	}
+	m.mu.Unlock()
+	return nil
 }

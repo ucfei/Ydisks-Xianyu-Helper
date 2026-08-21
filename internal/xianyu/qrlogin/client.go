@@ -3,10 +3,7 @@ package qrlogin
 
 import (
 	"context"
-	"crypto/md5"
-	rand "crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +11,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,11 +19,11 @@ import (
 	qrcode "github.com/skip2/go-qrcode"
 
 	"xianyu-go/internal/logsafe"
-	"xianyu-go/internal/xianyu"
 	"xianyu-go/internal/xianyu/cookierefresh"
 	xrenew "xianyu-go/internal/xianyu/renew"
 )
 
+// maxQRResponseBytes 用于本次流程后续判断的maxQR响应Bytes
 const (
 	maxQRResponseBytes = 2 << 20
 	qrPollInterval     = 2 * time.Second
@@ -35,6 +31,7 @@ const (
 	qrTopSite          = "https://goofish.com"
 )
 
+// host 用于本次流程后续判断的host
 const (
 	host          = "https://passport.goofish.com"
 	apiMiniLogin  = host + "/mini_login.htm"
@@ -45,8 +42,10 @@ const (
 	appKey        = "34839810"
 )
 
+// qrVerifyTargetURL 用于本次流程后续判断的qrVerifyTargetURL
 var qrVerifyTargetURL = "https://www.goofish.com/im"
 
+// qrHeaders 用于本次流程后续判断的qrHeaders
 var qrHeaders = map[string]string{
 	"Accept":          "application/json, text/plain, */*",
 	"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -60,16 +59,18 @@ var qrHeaders = map[string]string{
 
 // Session 一个扫码登录会话。
 type Session struct {
-	mu                     sync.RWMutex
-	SessionID              string `json:"session_id"`
-	Status                 string `json:"status"` // waiting/scanned/success/expired/cancelled/error/verification_required
-	QRCodeURL              string `json:"qr_code_url"`
-	qrContent              string
-	cookies                map[string]string
-	cookieSnapshot         []cookierefresh.BrowserCookie
-	unb                    string
-	createdTime            time.Time
-	expireTime             time.Duration
+	mu             sync.RWMutex
+	SessionID      string `json:"session_id"`
+	Status         string `json:"status"` // waiting/scanned/success/expired/cancelled/error/verification_required
+	QRCodeURL      string `json:"qr_code_url"`
+	qrContent      string
+	cookies        map[string]string
+	cookieSnapshot []cookierefresh.BrowserCookie
+	unb            string
+	createdTime    time.Time
+	expireTime     time.Duration
+	// lifecycleCtx 是当前会话全部后台任务共享的可取消根 Context，禁止进入 HTTP 返回值或日志。
+	lifecycleCtx           context.Context
 	params                 map[string]string
 	verificationURL        string
 	verificationScreenshot string // 历史兼容字段；纯 Go 人脸流程直接返回二维码
@@ -77,12 +78,14 @@ type Session struct {
 	faceQRContent          string // 人脸验证二维码原始内容，便于排查协议变化
 }
 
+// isExpired 封装isExpired业务协调。
 func (s *Session) isExpired() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return time.Since(s.createdTime) > s.expireTime
 }
 
+// sessionSnapshot 用于本次流程后续判断的会话Snapshot
 type sessionSnapshot struct {
 	status                 string
 	cookies                map[string]string
@@ -96,6 +99,7 @@ type sessionSnapshot struct {
 	createdTime            time.Time
 }
 
+// snapshot 封装snapshot业务协调。
 func (s *Session) snapshot() sessionSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -110,10 +114,24 @@ func (s *Session) snapshot() sessionSnapshot {
 
 // Manager 扫码登录管理器。
 type Manager struct {
-	mu       sync.Mutex
+	// mu 保护会话表、会话取消函数、根 Context 与 closing；不在持锁时执行网络或等待操作。
+	mu sync.Mutex
+	// sessions 保存当前可查询的二维码会话。
 	sessions map[string]*Session
-	httpc    *http.Client
-	logger   *slog.Logger
+	// sessionCancels 保存每个会话的根取消函数；删除或关闭会取消其监控和验证子任务。
+	sessionCancels map[string]context.CancelFunc
+	// lifecycleCtx 是二维码任务的进程根 Context，由 Start 注入并在 CloseContext 取消。
+	lifecycleCtx context.Context
+	// lifecycleCancel 取消当前二维码管理器拥有的根 Context。
+	lifecycleCancel context.CancelFunc
+	// closing 表示管理器已拒绝新会话，但仍等待已有任务收束。
+	closing bool
+	// tasks 记录所有由 Manager 启动的会话任务；CloseContext 负责等待其结束。
+	tasks sync.WaitGroup
+	// closeMu 串行化 CloseContext，避免多个调用重复取消和并发等待。
+	closeMu sync.Mutex
+	httpc   *http.Client
+	logger  *slog.Logger
 }
 
 // NewManager 构造。
@@ -121,19 +139,104 @@ func NewManager(logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Manager{
-		sessions: make(map[string]*Session),
-		httpc:    &http.Client{Timeout: 60 * time.Second},
-		logger:   logger,
+	// lifecycleCtx、lifecycleCancel 为未装配进程协调器的测试和兼容调用提供可关闭的默认根 Context。
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
+	return &Manager{sessions: make(map[string]*Session), sessionCancels: make(map[string]context.CancelFunc), lifecycleCtx: lifecycleCtx, lifecycleCancel: lifecycleCancel, httpc: &http.Client{Timeout: 60 * time.Second}, logger: logger}
+}
+
+// Start 注入进程协调器拥有的根 Context；启动后新会话的后台任务都从该 Context 派生。
+func (m *Manager) Start(ctx context.Context) error {
+	if m == nil || ctx == nil {
+		return errors.New("二维码管理器启动需要生命周期 Context")
 	}
+	// err 保存启动前调用方已经取消的生命周期 Context 错误。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closing {
+		return errors.New("二维码管理器已关闭")
+	}
+	// previousCancel 取消构造期默认根 Context；正常运行时尚未创建会话，避免遗留无主根 Context。
+	previousCancel := m.lifecycleCancel
+	// lifecycleCtx、lifecycleCancel 将进程根包装为 Manager 自己可取消的子 Context。
+	lifecycleCtx, lifecycleCancel := context.WithCancel(ctx)
+	m.lifecycleCtx = lifecycleCtx
+	m.lifecycleCancel = lifecycleCancel
+	if previousCancel != nil {
+		previousCancel()
+	}
+	return nil
+}
+
+// startSessionTask 在会话根 Context 下登记可等待后台任务；关闭后不再创建新的 goroutine。
+func (m *Manager) startSessionTask(sessionID string, timeout time.Duration, task func(context.Context)) bool {
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return false
+	}
+	// sessionCtx、exists 保存当前会话根 Context 及其是否仍在会话表中。
+	sessionCtx, exists := m.sessionContextLocked(sessionID)
+	if !exists {
+		m.mu.Unlock()
+		return false
+	}
+	m.tasks.Add(1)
+	m.mu.Unlock()
+	go func() {
+		// taskCtx、cancel 将会话取消和独立有效期合并，任务退出时必须释放定时器。
+		taskCtx, cancel := context.WithTimeout(sessionCtx, timeout)
+		defer cancel()
+		defer m.tasks.Done()
+		task(taskCtx)
+	}()
+	return true
+}
+
+// sessionContextLocked 返回会话根 Context；调用方必须已持有 m.mu。
+func (m *Manager) sessionContextLocked(sessionID string) (context.Context, bool) {
+	// sess 保存已登记会话；不存在、未初始化 Context 或已删除的会话都不得再启动后台任务。
+	sess, exists := m.sessions[sessionID]
+	if !exists || sess == nil {
+		return nil, false
+	}
+	if sess.lifecycleCtx == nil {
+		// rootCtx 为历史测试或兼容直接注入的会话补齐可取消根 Context；生产路径会在创建会话时预先登记。
+		rootCtx := m.lifecycleCtx
+		if rootCtx == nil {
+			rootCtx = context.Background()
+		}
+		// sessionCtx、sessionCancel 将补齐会话纳入 Manager 的统一取消表。
+		sessionCtx, sessionCancel := context.WithCancel(rootCtx)
+		sess.lifecycleCtx = sessionCtx
+		if m.sessionCancels == nil {
+			m.sessionCancels = make(map[string]context.CancelFunc)
+		}
+		m.sessionCancels[sessionID] = sessionCancel
+	}
+	// sessionCancel 表示会话是否仍由 Manager 持有取消权。
+	if sessionCancel := m.sessionCancels[sessionID]; sessionCancel == nil {
+		return nil, false
+	}
+	return sess.lifecycleCtx, true
 }
 
 // GenerateQRCode 生成扫码登录二维码。返回 session_id + qr_code_url（base64 data URL）。
 func (m *Manager) GenerateQRCode(ctx context.Context) (sessionID string, qrCodeURL string, err error) {
+	m.mu.Lock()
+	// closing 表示 Manager 已经进入关闭阶段，不能在执行任何平台请求前接受新二维码会话。
+	closing := m.closing
+	m.mu.Unlock()
+	if closing {
+		return "", "", errors.New("二维码管理器已关闭")
+	}
 	sessionID, err = randomUUID()
 	if err != nil {
 		return "", "", fmt.Errorf("生成扫码会话 ID: %w", err)
 	}
+	// sess 用于本次流程后续判断的sess
 	sess := &Session{
 		SessionID:      sessionID,
 		Status:         "waiting",
@@ -157,27 +260,33 @@ func (m *Manager) GenerateQRCode(ctx context.Context) (sessionID string, qrCodeU
 
 	// 3. 生成二维码。
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiGenerateQR, nil)
+	// q 用于本次流程后续判断的q
 	q := req.URL.Query()
+	// k、v 表示当前遍历过程中的k、v
 	for k, v := range loginParams {
 		q.Set(k, v)
 	}
 	req.URL.RawQuery = q.Encode()
 	m.setHeaders(req)
-	if cookieStr := sessionCookieHeader(sess, req.URL.String()); cookieStr != "" {
+	if // cookieStr 用于本次流程后续判断的登录凭证Str
+	cookieStr := sessionCookieHeader(sess, req.URL.String()); cookieStr != "" {
 		req.Header.Set("Cookie", cookieStr)
 	}
 
+	// resp、err 用于本次流程后续判断的resp、err
 	resp, err := m.httpc.Do(req)
 	if err != nil {
 		return "", "", fmt.Errorf("请求二维码接口失败: %w", err)
 	}
 	defer resp.Body.Close()
 	absorbSessionResponse(sess, apiGenerateQR, resp)
+	// body、err 用于本次流程后续判断的body、err
 	body, err := readQRBody(resp.Body)
 	if err != nil {
 		return "", "", err
 	}
 
+	// result 用于本次流程后续判断的结果
 	var result struct {
 		Content struct {
 			Success bool `json:"success"`
@@ -188,7 +297,8 @@ func (m *Manager) GenerateQRCode(ctx context.Context) (sessionID string, qrCodeU
 			} `json:"data"`
 		} `json:"content"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	if // err 用于本次流程后续判断的err
+	err := json.Unmarshal(body, &result); err != nil {
 		return "", "", fmt.Errorf("解析二维码响应失败: %w (body=%s)", err, truncate(string(body), 300))
 	}
 	if !result.Content.Success {
@@ -197,7 +307,8 @@ func (m *Manager) GenerateQRCode(ctx context.Context) (sessionID string, qrCodeU
 
 	// t 是毫秒时间戳数字，必须转成纯数字字符串（不能用科学计数法）。
 	var tStr string
-	switch tv := result.Content.Data.T.(type) {
+	switch // tv 用于本次流程后续判断的tv
+	tv := result.Content.Data.T.(type) {
 	case float64:
 		tStr = strconv.FormatInt(int64(tv), 10)
 	case string:
@@ -215,23 +326,33 @@ func (m *Manager) GenerateQRCode(ctx context.Context) (sessionID string, qrCodeU
 		return "", "", fmt.Errorf("生成二维码失败: %w", err)
 	}
 	png.DisableBorder = false
+	// pngBytes 用于本次流程后续判断的pngBytes
 	pngBytes, _ := png.PNG(256)
+	// pngBytes64 用于本次流程后续判断的pngBytes64
 	pngBytes64 := base64.StdEncoding.EncodeToString(pngBytes)
 	qrCodeURL = "data:image/png;base64," + pngBytes64
 
 	sess.QRCodeURL = qrCodeURL
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return "", "", errors.New("二维码管理器已关闭")
+	}
+	// sessionCtx、sessionCancel 将该会话绑定到进程根 Context；DeleteSession 和 CloseContext 都拥有取消权。
+	sessionCtx, sessionCancel := context.WithCancel(m.lifecycleCtx)
+	sess.lifecycleCtx = sessionCtx
 	m.sessions[sessionID] = sess
+	m.sessionCancels[sessionID] = sessionCancel
 	m.mu.Unlock()
 
-	// 5. 扫码会话独立于生成二维码的 HTTP 请求，但受会话有效期约束。
-	// #nosec G118 -- 后台任务必须跨越原请求，且由超时上下文保证退出。
-	go func() {
-		monitorCtx, cancel := context.WithTimeout(context.Background(), sess.snapshot().expireTime)
-		defer cancel()
+	// 5. 扫码会话独立于生成二维码的 HTTP 请求，但受会话和进程生命周期共同约束。
+	if !m.startSessionTask(sessionID, sess.snapshot().expireTime, func(monitorCtx context.Context) {
 		m.monitorQRStatus(monitorCtx, sessionID)
-	}()
+	}) {
+		m.DeleteSession(sessionID)
+		return "", "", errors.New("二维码会话后台任务未启动")
+	}
 
 	m.logger.Info("二维码生成成功", "session_id", sessionID)
 	return sessionID, qrCodeURL, nil
@@ -240,6 +361,7 @@ func (m *Manager) GenerateQRCode(ctx context.Context) (sessionID string, qrCodeU
 // GetSessionStatus 查询扫码状态。
 func (m *Manager) GetSessionStatus(sessionID string) map[string]any {
 	m.mu.Lock()
+	// sess、ok 用于本次流程后续判断的sess、ok
 	sess, ok := m.sessions[sessionID]
 	m.mu.Unlock()
 	if !ok {
@@ -249,6 +371,7 @@ func (m *Manager) GetSessionStatus(sessionID string) map[string]any {
 	if time.Since(sess.createdTime) > sess.expireTime && sess.Status != "success" {
 		sess.Status = "expired"
 	}
+	// snapshot 用于本次流程后续判断的snapshot
 	snapshot := sessionSnapshot{
 		status: sess.Status, cookies: cloneCookieMap(sess.cookies), unb: sess.unb,
 		cookieSnapshot:  cloneCookieSnapshot(sess.cookieSnapshot),
@@ -256,6 +379,7 @@ func (m *Manager) GetSessionStatus(sessionID string) map[string]any {
 		faceQRURL: sess.faceQRURL,
 	}
 	sess.mu.Unlock()
+	// result 用于本次流程后续判断的结果
 	result := map[string]any{
 		"status":     snapshot.status,
 		"session_id": sessionID,
@@ -287,21 +411,77 @@ func (m *Manager) GetSessionStatus(sessionID string) map[string]any {
 // DeleteSession 主动释放终态/过期扫码会话中的二维码、Cookie 和验证截图。
 func (m *Manager) DeleteSession(sessionID string) {
 	m.mu.Lock()
+	// sessionCancel 是当前会话全部后台任务的唯一取消入口；先从表中移除再锁外取消，避免新任务重新登记。
+	sessionCancel := m.sessionCancels[sessionID]
 	delete(m.sessions, sessionID)
+	delete(m.sessionCancels, sessionID)
 	m.mu.Unlock()
+	if sessionCancel != nil {
+		sessionCancel()
+	}
+}
+
+// CloseContext 拒绝新会话、取消全部已有任务并等待其退出；超时时可使用新的 Context 重试等待。
+func (m *Manager) CloseContext(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	if ctx == nil {
+		return errors.New("关闭二维码管理器需要 Context")
+	}
+	// err 保存关闭等待开始前调用方已经取消的关闭 Context 错误。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	m.mu.Lock()
+	m.closing = true
+	// lifecycleCancel 取消由 Start 或构造期创建的根 Context；sessionCancels 额外确保会话可立即停止。
+	lifecycleCancel := m.lifecycleCancel
+	// sessionCancels 保存待锁外触发的每个会话取消函数。
+	sessionCancels := make([]context.CancelFunc, 0, len(m.sessionCancels))
+	// _, sessionCancel 分别表示会话标识和对应的根取消函数，后者在锁外取消全部会话任务。
+	for _, sessionCancel := range m.sessionCancels {
+		sessionCancels = append(sessionCancels, sessionCancel)
+	}
+	m.mu.Unlock()
+	if lifecycleCancel != nil {
+		lifecycleCancel()
+	}
+	// _, sessionCancel 分别表示待取消列表下标和当前会话根取消函数。
+	for _, sessionCancel := range sessionCancels {
+		sessionCancel()
+	}
+	// done 仅观察 Manager 自己拥有的 WaitGroup；任务已被取消，waiter 结束后不会留下后台生命周期。
+	done := make(chan struct{})
+	go func() {
+		m.tasks.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // monitorQRStatus 后台轮询扫码状态。
 func (m *Manager) monitorQRStatus(ctx context.Context, sessionID string) {
 	m.mu.Lock()
+	// sess 用于本次流程后续判断的sess
 	sess := m.sessions[sessionID]
 	m.mu.Unlock()
 	if sess == nil {
 		return
 	}
 
+	// maxWait 用于本次流程后续判断的maxWait
 	maxWait := 5 * time.Minute
+	// start 用于本次流程后续判断的开始
 	start := time.Now()
+	// serverErrors 用于本次流程后续判断的server错误列表
 	serverErrors := 0
 
 	for time.Since(start) < maxWait {
@@ -312,12 +492,14 @@ func (m *Manager) monitorQRStatus(ctx context.Context, sessionID string) {
 		}
 
 		m.mu.Lock()
-		if _, ok := m.sessions[sessionID]; !ok {
+		if // ok 用于本次流程后续判断的ok
+		_, ok := m.sessions[sessionID]; !ok {
 			m.mu.Unlock()
 			return
 		}
 		m.mu.Unlock()
 
+		// resp、err 用于本次流程后续判断的resp、err
 		resp, err := m.pollQRCodeStatus(ctx, sess)
 		if err != nil {
 			m.logger.Error("轮询扫码状态异常", "err", err)
@@ -327,7 +509,9 @@ func (m *Manager) monitorQRStatus(ctx context.Context, sessionID string) {
 			continue
 		}
 		absorbSessionResponse(sess, apiScanStatus, resp)
+		// body、readErr 用于本次流程后续判断的body、readErr
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		// closeErr 用于本次流程后续判断的closeErr
 		closeErr := resp.Body.Close()
 		if readErr != nil || closeErr != nil {
 			m.logger.Warn("读取扫码状态响应失败", "read_err", readErr, "close_err", closeErr)
@@ -337,6 +521,7 @@ func (m *Manager) monitorQRStatus(ctx context.Context, sessionID string) {
 			continue
 		}
 
+		// qrResult 用于本次流程后续判断的qr结果
 		var qrResult struct {
 			HasError bool `json:"hasError"`
 			Content  struct {
@@ -347,7 +532,8 @@ func (m *Manager) monitorQRStatus(ctx context.Context, sessionID string) {
 				} `json:"data"`
 			} `json:"content"`
 		}
-		if err := json.Unmarshal(body, &qrResult); err != nil {
+		if // err 用于本次流程后续判断的err
+		err := json.Unmarshal(body, &qrResult); err != nil {
 			m.logger.Warn("解析扫码状态响应失败", "err", err)
 			if !waitQRRetry(ctx, qrPollInterval) {
 				return
@@ -368,63 +554,11 @@ func (m *Manager) monitorQRStatus(ctx context.Context, sessionID string) {
 		}
 		serverErrors = 0
 
+		// status 用于本次流程后续判断的状态
 		status := qrResult.Content.Data.QRCodeStatus
 		switch status {
 		case "CONFIRMED":
-			if qrResult.Content.Data.IframeRedirect {
-				// 风控验证：记录状态和 URL，提取响应 cookie（临时 cookie），
-				// 验证完成后用这些临时 cookie 访问 goofish.com/im 换真实 cookie。
-				sess.mu.Lock()
-				if sess.Status == "success" {
-					sess.mu.Unlock()
-					return
-				}
-				if sess.Status != "verification_required" {
-					sess.Status = "verification_required"
-					sess.verificationURL = qrResult.Content.Data.IframeRedirectURL
-					// 已有权威快照交给可导出的 Go Cookie Jar；它会继续吸收
-					// 人脸跳转链每个重定向响应的 Set-Cookie。
-					// 人脸验证会额外占用用户手机端操作时间。这里重置窗口，避免普通
-					// 扫码 5 分钟窗口在用户扫人脸二维码时把会话误标为 expired。
-					sess.createdTime = time.Now()
-					sess.expireTime = 5 * time.Minute
-					verURL := sess.verificationURL
-					expireTime := sess.expireTime
-					cookieCount := len(sess.cookies)
-					sess.mu.Unlock()
-					m.logger.Warn("扫码登录需要风控验证，使用 Go HTTP 保持原登录会话", "session_id", sessionID, "verification_url", logsafe.URL(verURL), "tmp_cookie_count", cookieCount)
-					// #nosec G118 -- 验证必须跨越轮询请求，且由独立五分钟上下文保证退出。
-					go func() {
-						verifyCtx, cancel := context.WithTimeout(context.Background(), expireTime)
-						defer cancel()
-						m.runGoVerification(verifyCtx, sessionID, verURL)
-					}()
-				} else {
-					sess.mu.Unlock()
-				}
-				return
-			}
-			// 二维码组件确认成功后，真实网页还会进入 /im 并跟随登录
-			// 重定向。部分账号的长登录 Cookie 只在这一步下发，不能只
-			// 保存 query.do 的响应头。
-			if err := m.completeConfirmedLogin(ctx, sess); err != nil {
-				m.logger.Warn("扫码确认后的官网登录跳转未完成，保留当前登录凭证", "session_id", sessionID, "err", err)
-			}
-			if err := m.enableConfirmedLongLogin(ctx, sess); err != nil {
-				m.logger.Warn("扫码登录已成功，但官网保持登录开启失败", "session_id", sessionID, "err", err)
-			}
-			sess.mu.Lock()
-			sess.Status = "success"
-			finalizeSessionCredentialsLocked(sess)
-			unb := sess.unb
-			cookieCount := len(sess.cookies)
-			hasHavanaLongLogin := sess.cookies["havana_lgc_exp"] != ""
-			hasCookie3Backup := sess.cookies["cookie3_bak_exp"] != ""
-			snapshotComplete := sess.cookieSnapshot != nil
-			sess.mu.Unlock()
-			m.logger.Info("扫码登录成功", "session_id", sessionID, "account_hash", logsafe.ID(unb),
-				"cookie_count", cookieCount, "cookie_snapshot_complete", snapshotComplete,
-				"has_havana_lgc_exp", hasHavanaLongLogin, "has_cookie3_bak_exp", hasCookie3Backup)
+			m.handleConfirmedQRStatus(ctx, sess, sessionID, qrResult.Content.Data.IframeRedirect, qrResult.Content.Data.IframeRedirectURL)
 			return
 		case "NEW":
 			// 未扫码，继续
@@ -472,37 +606,46 @@ func (m *Manager) monitorQRStatus(ctx context.Context, sessionID string) {
 
 // completeConfirmedLogin 对齐二维码组件确认后的顶层页面跳转。专用 Cookie
 // Jar 会捕获自动重定向链上的全部 Set-Cookie，并保留 Domain/Path/HttpOnly。
+// completeConfirmedLogin 封装completeConfirmed登录业务协调。
 func (m *Manager) completeConfirmedLogin(ctx context.Context, sess *Session) error {
 	if sess == nil {
 		return errors.New("扫码会话为空")
 	}
+	// state 用于本次流程后续判断的状态
 	state := sess.snapshot()
+	// client、jar、err 用于本次流程后续判断的client、jar、err
 	client, jar, err := m.faceHTTPClient(state.cookies, state.cookieSnapshot, apiScanStatus, qrVerifyTargetURL)
 	if err != nil {
 		return fmt.Errorf("创建扫码完成 Cookie Jar: %w", err)
 	}
+	// req、err 用于本次流程后续判断的req、err
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, qrVerifyTargetURL, nil)
 	if err != nil {
 		return fmt.Errorf("创建扫码完成请求: %w", err)
 	}
 	m.setDocumentHeaders(req)
+	// resp、err 用于本次流程后续判断的resp、err
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("访问闲鱼消息页完成登录: %w", err)
 	}
 	defer resp.Body.Close()
-	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 2<<20)); err != nil {
+	if // err 用于本次流程后续判断的err
+	_, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 2<<20)); err != nil {
 		return fmt.Errorf("读取扫码完成响应: %w", err)
 	}
 
+	// urls 用于本次流程后续判断的urls
 	urls := []*url.URL{mustParseURL(qrVerifyTargetURL)}
 	if resp.Request != nil && resp.Request.URL != nil {
 		urls = append(urls, resp.Request.URL)
 	}
+	// finalCookies 用于本次流程后续判断的finalCookies
 	finalCookies := collectJarCookies(jar, urls...)
 	if finalCookies["unb"] == "" {
 		return errors.New("扫码完成跳转未保留账号标识")
 	}
+	// finalSnapshot、snapshotComplete 用于本次流程后续判断的finalSnapshot、snapshotComplete
 	finalSnapshot, snapshotComplete := jar.Snapshot()
 	sess.mu.Lock()
 	sess.cookies = finalCookies
@@ -518,13 +661,18 @@ func (m *Manager) completeConfirmedLogin(ctx context.Context, sess *Session) err
 
 // enableConfirmedLongLogin 对齐官网账号安全页的“保持登录”开关：先提交
 // status=0，再查询 hasLongTokenLogin，并保存两次响应更新后的完整 Cookie Jar。
+// enableConfirmedLongLogin 封装enableConfirmedLong登录业务协调。
 func (m *Manager) enableConfirmedLongLogin(ctx context.Context, sess *Session) error {
 	if sess == nil {
 		return errors.New("扫码会话为空")
 	}
+	// state 用于本次流程后续判断的状态
 	state := sess.snapshot()
+	// service 用于本次流程后续判断的service
 	service := xrenew.Service{HTTPClient: m.httpc, DocumentReferer: qrVerifyTargetURL}
+	// settings 用于本次流程后续判断的设置
 	var settings *xrenew.LongLoginSettings
+	// err 用于本次流程后续判断的err
 	var err error
 	if state.cookieSnapshot != nil {
 		settings, err = service.SetLongLoginSettings(ctx, cookieMarshal(state.cookies), true, state.cookieSnapshot)
@@ -541,7 +689,8 @@ func (m *Manager) enableConfirmedLongLogin(ctx context.Context, sess *Session) e
 			finalizeSessionCredentialsLocked(sess)
 		} else if strings.TrimSpace(settings.NewCookies) != "" {
 			sess.cookies = parseCookieStr(settings.NewCookies)
-			if unb := sess.cookies["unb"]; unb != "" {
+			if // unb 用于本次流程后续判断的unb
+			unb := sess.cookies["unb"]; unb != "" {
 				sess.unb = unb
 			}
 		}
@@ -556,17 +705,21 @@ func (m *Manager) enableConfirmedLongLogin(ctx context.Context, sess *Session) e
 	return nil
 }
 
+// runGoVerification 封装运行GoVerification业务协调。
 func (m *Manager) runGoVerification(ctx context.Context, sessionID, verificationURL string) {
 	if !strings.Contains(verificationURL, "/iv/") && !strings.Contains(verificationURL, "identity_verify") {
 		m.logger.Warn("扫码验证地址不属于已支持的人脸流程，保持人工验证状态", "session_id", sessionID, "verification_url", logsafe.URL(verificationURL))
 		return
 	}
-	if err := m.runFaceVerification(ctx, sessionID, verificationURL); err != nil {
+	if // err 用于本次流程后续判断的err
+	err := m.runFaceVerification(ctx, sessionID, verificationURL); err != nil {
 		m.logger.Warn("扫码人脸验证 Go HTTP 流程未完成，保持人工验证状态", "session_id", sessionID, "err", err)
 	}
 }
 
+// waitQRRetry 封装waitQR重试业务协调。
 func waitQRRetry(ctx context.Context, delay time.Duration) bool {
+	// timer 用于本次流程后续判断的定时器
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -579,404 +732,4 @@ func waitQRRetry(ctx context.Context, delay time.Duration) bool {
 
 // CompleteVerification 用户完成风控验证后调用。整个凭证换取过程只使用
 // Go Cookie Jar；不得导航浏览器页面或通过 DOM 判断登录状态。
-func (m *Manager) CompleteVerification(ctx context.Context, sessionID string) (cookies string, unb string, err error) {
-	m.mu.Lock()
-	sess, ok := m.sessions[sessionID]
-	m.mu.Unlock()
-	if !ok {
-		return "", "", fmt.Errorf("会话不存在")
-	}
-	state := sess.snapshot()
-	if len(state.cookies) == 0 {
-		return "", "", fmt.Errorf("无扫码临时 cookie")
-	}
-	if state.status == "success" && state.unb != "" {
-		return snapshotCookieHeader(state, qrVerifyTargetURL), state.unb, nil
-	}
-	m.logger.Info("开始用临时 cookie 换取真实 cookie", "session_id", sessionID, "tmp_cookie_count", len(state.cookies))
-
-	targetURL := qrVerifyTargetURL
-	seedURL := state.verificationURL
-	if strings.TrimSpace(seedURL) == "" {
-		seedURL = targetURL
-	}
-	jarClient, jar, err := m.faceHTTPClient(state.cookies, state.cookieSnapshot, seedURL, targetURL)
-	if err != nil {
-		return "", "", fmt.Errorf("创建登录 Cookie Jar: %w", err)
-	}
-	jarClient.Timeout = 30 * time.Second
-	target, err := url.Parse(targetURL)
-	if err != nil {
-		return "", "", fmt.Errorf("解析登录凭证换取地址: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-	if err != nil {
-		return "", "", err
-	}
-	m.setDocumentHeaders(req)
-	resp, err := jarClient.Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("访问 goofish.com/im 换取登录凭证失败: %w", err)
-	}
-	defer resp.Body.Close()
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		return "", "", fmt.Errorf("读取登录凭证换取响应失败: %w", err)
-	}
-	var responseURL *url.URL
-	if resp.Request != nil {
-		responseURL = resp.Request.URL
-	}
-	finalCookies := collectJarCookies(jar, target, responseURL)
-	finalUNB := finalCookies["unb"]
-	if finalUNB == "" {
-		return "", "", fmt.Errorf("纯 Go 登录凭证换取未获取到 unb，验证可能尚未完成或临时 Cookie 已失效")
-	}
-	sess.mu.Lock()
-	sess.cookies = finalCookies
-	if finalSnapshot, complete := jar.Snapshot(); complete {
-		sess.cookieSnapshot = finalSnapshot
-	} else {
-		sess.cookieSnapshot = nil
-	}
-	sess.unb = finalUNB
-	sess.Status = "success"
-	sess.verificationScreenshot = ""
-	sess.mu.Unlock()
-	m.logger.Info("纯 Go 提取登录凭证成功", "session_id", sessionID, "account_hash", logsafe.ID(finalUNB), "cookie_count", len(finalCookies))
-	return snapshotCookieHeader(sess.snapshot(), qrVerifyTargetURL), finalUNB, nil
-}
-
-// parseCookieStr 把 "k=v; k2=v2" 解析回 map。
-func parseCookieStr(s string) map[string]string {
-	m := make(map[string]string)
-	for _, part := range strings.Split(s, "; ") {
-		if eq := strings.Index(part, "="); eq >= 0 {
-			m[part[:eq]] = part[eq+1:]
-		}
-	}
-	return m
-}
-
-// getMH5TK 获取 m_h5_tk。
-func (m *Manager) getMH5TK(ctx context.Context, sess *Session) error {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiH5TK, nil)
-	m.setHeaders(req)
-
-	resp, err := m.httpc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	absorbSessionResponse(sess, apiH5TK, resp)
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		return err
-	}
-	mH5TK := protocolCookieValue(sessionCookieHeader(sess, apiH5TK), "_m_h5_tk")
-	token := ""
-	if parts := strings.SplitN(mH5TK, "_", 2); len(parts) > 0 {
-		token = parts[0]
-	}
-
-	t := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	dataStr := `{"bizScene":"home"}`
-	signInput := token + "&" + t + "&" + appKey + "&" + dataStr
-	sign := md5hex(signInput)
-
-	params := url.Values{}
-	params.Set("jsv", "2.7.2")
-	params.Set("appKey", appKey)
-	params.Set("t", t)
-	params.Set("sign", sign)
-	params.Set("v", "1.0")
-	params.Set("type", "originaljson")
-	params.Set("dataType", "json")
-	params.Set("timeout", "20000")
-	params.Set("api", "mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get")
-	params.Set("data", dataStr)
-
-	req2, _ := http.NewRequestWithContext(ctx, http.MethodPost, apiH5TK+"?"+params.Encode(), nil)
-	m.setHeaders(req2)
-	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	cookieStr := sessionCookieHeader(sess, req2.URL.String())
-	if cookieStr != "" {
-		req2.Header.Set("Cookie", cookieStr)
-	}
-
-	resp2, err := m.httpc.Do(req2)
-	if err != nil {
-		return err
-	}
-	defer resp2.Body.Close()
-	absorbSessionResponse(sess, req2.URL.String(), resp2)
-	if _, err := io.Copy(io.Discard, resp2.Body); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// getLoginParams 获取登录表单参数。
-func (m *Manager) getLoginParams(ctx context.Context, sess *Session) (map[string]string, error) {
-	params := url.Values{}
-	params.Set("lang", "zh_cn")
-	params.Set("appName", "xianyu")
-	params.Set("appEntrance", "web")
-	params.Set("styleType", "vertical")
-	params.Set("bizParams", "")
-	params.Set("notLoadSsoView", "false")
-	params.Set("notKeepLogin", "false")
-	params.Set("isMobile", "false")
-	params.Set("qrCodeFirst", "false")
-	params.Set("stie", "77")
-	params.Set("rnd", strconv.FormatFloat(randFloat(), 'f', -1, 64))
-
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiMiniLogin+"?"+params.Encode(), nil)
-	m.setHeaders(req)
-
-	// 带上已有 cookie。
-	cookieStr := sessionCookieHeader(sess, req.URL.String())
-	if cookieStr != "" {
-		req.Header.Set("Cookie", cookieStr)
-	}
-
-	resp, err := m.httpc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	absorbSessionResponse(sess, req.URL.String(), resp)
-	body, err := readQRBody(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	// 调试：打印响应状态和 body 前 200 字符
-
-	// 从 HTML 里提取 window.viewData = {...};
-	re := regexp.MustCompile(`window\.viewData\s*=\s*(\{.*?\});`)
-	match := re.FindSubmatch(body)
-	if match == nil {
-		return nil, fmt.Errorf("获取登录参数失败：未找到 viewData")
-	}
-
-	var viewData struct {
-		LoginFormData map[string]any `json:"loginFormData"`
-	}
-	if err := json.Unmarshal(match[1], &viewData); err != nil {
-		return nil, fmt.Errorf("解析 viewData 失败: %w", err)
-	}
-	if viewData.LoginFormData == nil {
-		return nil, fmt.Errorf("loginFormData 为空")
-	}
-	// 把所有值转为字符串（有些是 bool/number）。
-	strParams := make(map[string]string, len(viewData.LoginFormData))
-	for k, v := range viewData.LoginFormData {
-		strParams[k] = fmt.Sprintf("%v", v)
-	}
-	strParams["umidTag"] = "SERVER"
-	sess.mu.Lock()
-	sess.params = strParams
-	sess.mu.Unlock()
-	return strParams, nil
-}
-
-// pollQRCodeStatus 轮询二维码状态。
-func (m *Manager) pollQRCodeStatus(ctx context.Context, sess *Session) (*http.Response, error) {
-	form := url.Values{}
-	state := sess.snapshot()
-	for k, v := range state.params {
-		form.Set(k, v)
-	}
-	fingerprint := xianyu.CurrentBrowserFingerprint()
-	// 对齐 havana-nlogin 二维码组件 query.do 的浏览器环境字段。
-	// ua 是 AWSC/UAB 的可选结果；纯 Go 客户端在该值尚未生成时与官网
-	// 脚本一样发送空值，不借助 Chromium 执行业务页面脚本。
-	form.Set("ua", "")
-	form.Set("navlanguage", "zh-CN")
-	form.Set("navUserAgent", fingerprint.UserAgent)
-	form.Set("navPlatform", navigatorPlatform(fingerprint.Platform))
-	form.Set("isIframe", "true")
-	form.Set("documentReferer", qrVerifyTargetURL)
-	form.Set("defaultView", "qrcode")
-
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, apiScanStatus, strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	m.setHeaders(req)
-	cookieStr := sessionCookieHeader(sess, req.URL.String())
-	if cookieStr != "" {
-		req.Header.Set("Cookie", cookieStr)
-	}
-
-	return m.httpc.Do(req)
-}
-
-func navigatorPlatform(secCHPlatform string) string {
-	switch strings.ToLower(strings.TrimSpace(secCHPlatform)) {
-	case "windows":
-		return "Win32"
-	case "macos":
-		return "MacIntel"
-	case "linux":
-		return "Linux x86_64"
-	case "android":
-		return "Linux armv8l"
-	case "ios":
-		return "iPhone"
-	default:
-		return strings.TrimSpace(secCHPlatform)
-	}
-}
-
-func (m *Manager) setHeaders(req *http.Request) {
-	xianyu.ApplyBrowserFingerprint(req.Header)
-	for k, v := range qrHeaders {
-		req.Header.Set(k, v)
-	}
-}
-
-// setDocumentHeaders 复刻浏览器从闲鱼首页进入 /im 的文档请求头。这里只
-// 发送 HTTP 请求并接收 Set-Cookie，不加载或校验任何页面 DOM。
-func (m *Manager) setDocumentHeaders(req *http.Request) {
-	xianyu.ApplyBrowserFingerprint(req.Header)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	req.Header.Set("Referer", "https://www.goofish.com/")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-}
-
-func sessionCookieHeader(sess *Session, requestURL string) string {
-	if sess == nil {
-		return ""
-	}
-	return snapshotCookieHeader(sess.snapshot(), requestURL)
-}
-
-func snapshotCookieHeader(state sessionSnapshot, requestURL string) string {
-	if state.cookieSnapshot != nil {
-		if value, authoritative := cookierefresh.ScopedCookieHeaderForRequest(
-			state.cookieSnapshot, requestURL, qrTopSite, time.Now(),
-		); authoritative {
-			return value
-		}
-	}
-	return cookieMarshal(state.cookies)
-}
-
-func absorbSessionResponse(sess *Session, requestURL string, resp *http.Response) {
-	if sess == nil || resp == nil {
-		return
-	}
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	if sess.cookieSnapshot != nil {
-		sess.cookieSnapshot = cookierefresh.ApplySetCookies(
-			sess.cookieSnapshot, requestURL, resp.Header.Values("Set-Cookie"), time.Now(), qrTopSite,
-		)
-		if sess.cookieSnapshot == nil {
-			sess.cookieSnapshot = []cookierefresh.BrowserCookie{}
-		}
-	}
-	for _, cookie := range resp.Cookies() {
-		if cookie == nil || cookie.Name == "" {
-			continue
-		}
-		if cookie.MaxAge < 0 || (!cookie.Expires.IsZero() && !cookie.Expires.After(time.Now())) {
-			delete(sess.cookies, cookie.Name)
-			if cookie.Name == "unb" {
-				sess.unb = ""
-			}
-			continue
-		}
-		sess.cookies[cookie.Name] = cookie.Value
-		if cookie.Name == "unb" && cookie.Value != "" {
-			sess.unb = cookie.Value
-		}
-	}
-}
-
-func finalizeSessionCredentialsLocked(sess *Session) {
-	if sess == nil {
-		return
-	}
-	if sess.cookieSnapshot != nil {
-		value, _ := cookierefresh.ScopedCookieHeaderForRequest(
-			sess.cookieSnapshot, qrVerifyTargetURL, qrTopSite, time.Now(),
-		)
-		sess.cookies = parseCookieStr(value)
-	}
-	if unb := sess.cookies["unb"]; unb != "" {
-		sess.unb = unb
-	}
-}
-
-func cloneCookieSnapshot(in []cookierefresh.BrowserCookie) []cookierefresh.BrowserCookie {
-	if in == nil {
-		return nil
-	}
-	out := cookierefresh.NormalizeSnapshot(in)
-	if out == nil {
-		return []cookierefresh.BrowserCookie{}
-	}
-	return out
-}
-
-func protocolCookieValue(cookieHeader, name string) string {
-	for _, part := range strings.Split(cookieHeader, ";") {
-		key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
-		if ok && key == name {
-			return value
-		}
-	}
-	return ""
-}
-
-// ---- 工具函数 ----
-
-func md5hex(s string) string {
-	// #nosec G401 -- 闲鱼登录协议明确要求 MD5，不能替换为其他摘要算法。
-	h := md5.Sum([]byte(s))
-	return hex.EncodeToString(h[:])
-}
-
-func cookieMarshal(cookies map[string]string) string {
-	parts := make([]string, 0, len(cookies))
-	for k, v := range cookies {
-		parts = append(parts, k+"="+v)
-	}
-	return strings.Join(parts, "; ")
-}
-
-func randomUUID() (string, error) {
-	b := make([]byte, 16)
-	if _, err := io.ReadFull(randReader, b); err != nil {
-		return "", err
-	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
-}
-
-var randReader io.Reader = rand.Reader
-var randFloat = func() float64 { return float64(time.Now().UnixNano()%1e9) / 1e9 }
-
-func readQRBody(r io.Reader) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(r, maxQRResponseBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(body) > maxQRResponseBytes {
-		return nil, fmt.Errorf("扫码登录响应体超过 %d MiB", maxQRResponseBytes>>20)
-	}
-	return body, nil
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}
+// CompleteVerification 封装CompleteVerification业务协调。

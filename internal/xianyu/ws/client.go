@@ -3,7 +3,6 @@ package ws
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,11 +24,13 @@ import (
 // WSURL 闲鱼 IM WebSocket 地址。
 const WSURL = "wss://wss-goofish.dingtalk.com:443"
 
+// wsOpenTimeout 用于本次流程后续判断的wsOpenTimeout
 const (
 	wsOpenTimeout      = 30 * time.Second
 	regResponseTimeout = 30 * time.Second
 )
 
+// heartbeatResponseTimeout 用于本次流程后续判断的heartbeat响应Timeout
 var (
 	heartbeatResponseTimeout = 30 * time.Second
 	batchConnectDelays       = []time.Duration{0, 200 * time.Millisecond, 900 * time.Millisecond, 1500 * time.Millisecond, 4 * time.Second}
@@ -67,6 +68,7 @@ type Conn struct {
 	pushes    chan incomingFrame
 }
 
+// incomingFrame 用于本次流程后续判断的incomingFrame
 type incomingFrame struct {
 	messageType websocket.MessageType
 	data        []byte
@@ -80,8 +82,10 @@ func (c *Conn) SetRecorder(rec func(direction, rawText, parsedJSON, parseStatus,
 	c.recorderMu.Unlock()
 }
 
+// recorderSnapshot 封装recorderSnapshot业务协调。
 func (c *Conn) recorderSnapshot() func(direction, rawText, parsedJSON, parseStatus, errMsg string) {
 	c.recorderMu.RLock()
+	// recorder 用于本次流程后续判断的recorder
 	recorder := c.recorder
 	c.recorderMu.RUnlock()
 	return recorder
@@ -89,12 +93,15 @@ func (c *Conn) recorderSnapshot() func(direction, rawText, parsedJSON, parseStat
 
 // Dial 保留旧的一步式入口；新账号主循环使用 Open → 获取 token → Register，
 // 从而与官网 authConnect 的顺序一致。
+// Dial 封装Dial业务协调。
 func Dial(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error) {
+	// conn、err 用于本次流程后续判断的conn、err
 	conn, err := Open(ctx, cfg, logger)
 	if err != nil {
 		return nil, err
 	}
-	if err := conn.Register(ctx, cfg.DeviceID, cfg.AccessToken); err != nil {
+	if // err 用于本次流程后续判断的err
+	err := conn.Register(ctx, cfg.DeviceID, cfg.AccessToken); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -104,6 +111,7 @@ func Dial(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error) {
 // Open 按官网 batchConnectWs 策略并行打开最多五条原生 WebSocket，由最先
 // settle 的成功或失败决定本轮结果，并关闭迟到连接。此阶段不请求 token，
 // 也不发送 /reg。
+// Open 打开当前值。
 func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -112,15 +120,19 @@ func Open(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error) {
 	return openBatch(ctx, WSURL, cfg, logger)
 }
 
+// websocketHeaders 封装websocketHeaders业务协调。
 func websocketHeaders() http.Header {
+	// hdr 用于本次流程后续判断的hdr
 	hdr := http.Header{}
 	hdr.Set("Origin", "https://www.goofish.com")
-	if ua := xianyu.CurrentBrowserFingerprint().UserAgent; ua != "" {
+	if // ua 用于本次流程后续判断的ua
+	ua := xianyu.CurrentBrowserFingerprint().UserAgent; ua != "" {
 		hdr.Set("User-Agent", ua)
 	}
 	return hdr
 }
 
+// chromeVersionPattern 用于本次流程后续判断的chromeVersionPattern
 var (
 	chromeVersionPattern  = regexp.MustCompile(`(?:Chrome|CriOS)/([\d.]+)`)
 	headlessChromePattern = regexp.MustCompile(`HeadlessChrome/([\d.]+)`)
@@ -135,12 +147,15 @@ var (
 // OfficialRegistrationUA mirrors IMPaaS 2.2.0's ua-parser-js composition.
 // The raw UA (and therefore its browser version) comes from local Chromium;
 // all wrapper fields and ordering are fixed to the official web implementation.
+// OfficialRegistrationUA 封装OfficialRegistrationUA业务协调。
 func OfficialRegistrationUA(rawUA string) string {
 	rawUA = strings.TrimSpace(rawUA)
 	if rawUA == "" {
 		return ""
 	}
+	// osName、osVersion 用于本次流程后续判断的osName、osVersion
 	osName, osVersion := parseOfficialOS(rawUA)
+	// browserName、browserVersion 用于本次流程后续判断的浏览器Name、browserVersion
 	browserName, browserVersion := parseOfficialBrowser(rawUA)
 	return strings.Join([]string{
 		rawUA,
@@ -153,18 +168,24 @@ func OfficialRegistrationUA(rawUA string) string {
 	}, " ")
 }
 
+// parseOfficialOS 封装parseOfficialOS业务协调。
 func parseOfficialOS(ua string) (string, string) {
-	if match := macVersionPattern.FindStringSubmatch(ua); len(match) == 2 {
+	if // match 用于本次流程后续判断的match
+	match := macVersionPattern.FindStringSubmatch(ua); len(match) == 2 {
 		return "Mac OS", strings.ReplaceAll(match[1], "_", ".")
 	}
-	if match := windowsVersionPattern.FindStringSubmatch(ua); len(match) == 2 {
+	if // match 用于本次流程后续判断的match
+	match := windowsVersionPattern.FindStringSubmatch(ua); len(match) == 2 {
+		// versions 用于本次流程后续判断的versions
 		versions := map[string]string{"10.0": "10", "6.3": "8.1", "6.2": "8", "6.1": "7", "6.0": "Vista", "5.1": "XP"}
-		if version := versions[match[1]]; version != "" {
+		if // version 用于本次流程后续判断的version
+		version := versions[match[1]]; version != "" {
 			return "Windows", version
 		}
 		return "Windows", match[1]
 	}
-	if match := androidVersionPattern.FindStringSubmatch(ua); len(match) == 2 {
+	if // match 用于本次流程后续判断的match
+	match := androidVersionPattern.FindStringSubmatch(ua); len(match) == 2 {
 		return "Android", match[1]
 	}
 	if strings.Contains(ua, "Linux") {
@@ -173,34 +194,45 @@ func parseOfficialOS(ua string) (string, string) {
 	return "other", "other"
 }
 
+// parseOfficialBrowser 封装parseOfficial浏览器业务协调。
 func parseOfficialBrowser(ua string) (string, string) {
+	// candidate 表示当前遍历过程中的candidate
 	for _, candidate := range []struct {
 		name    string
 		pattern *regexp.Regexp
 	}{{"Edge", edgeVersionPattern}, {"Chrome Headless", headlessChromePattern}, {"Chrome", chromeVersionPattern}, {"Firefox", firefoxVersionPattern}, {"Safari", safariVersionPattern}} {
-		if match := candidate.pattern.FindStringSubmatch(ua); len(match) == 2 {
+		if // match 用于本次流程后续判断的match
+		match := candidate.pattern.FindStringSubmatch(ua); len(match) == 2 {
 			return candidate.name, match[1]
 		}
 	}
 	return "other", "other"
 }
 
+// dialResult 用于本次流程后续判断的dial结果
 type dialResult struct {
 	conn *websocket.Conn
 	err  error
 }
 
+// openBatch 封装open批次业务协调。
 func openBatch(ctx context.Context, target string, cfg Config, logger *slog.Logger) (*Conn, error) {
+	// delays 用于本次流程后续判断的delays
 	delays := append([]time.Duration(nil), batchConnectDelays...)
 	if len(delays) == 0 {
 		return nil, fmt.Errorf("WS dial: batchConnect 未配置竞速连接")
 	}
+	// batchCtx、cancel 用于本次流程后续判断的批次Ctx、cancel
 	batchCtx, cancel := context.WithCancel(ctx)
+	// results 用于本次流程后续判断的results
 	results := make(chan dialResult, len(delays))
+	// delay 表示当前遍历过程中的延迟
 	for _, delay := range delays {
+		// delay 用于本次流程后续判断的延迟
 		delay := delay
 		go func() {
 			if delay > 0 {
+				// timer 用于本次流程后续判断的定时器
 				timer := time.NewTimer(delay)
 				defer timer.Stop()
 				select {
@@ -210,8 +242,10 @@ func openBatch(ctx context.Context, target string, cfg Config, logger *slog.Logg
 				case <-timer.C:
 				}
 			}
+			// dialCtx、dialCancel 用于本次流程后续判断的dialCtx、dial取消
 			dialCtx, dialCancel := context.WithTimeout(batchCtx, wsOpenTimeout)
 			defer dialCancel()
+			// conn、err 用于本次流程后续判断的conn、err
 			conn, _, err := websocket.Dial(dialCtx, target, &websocket.DialOptions{HTTPHeader: websocketHeaders()})
 			results <- dialResult{conn: conn, err: err}
 		}()
@@ -219,10 +253,13 @@ func openBatch(ctx context.Context, target string, cfg Config, logger *slog.Logg
 
 	// 官网使用 Promise.race：第一条完成的连接无论成功或失败都会决定本轮
 	// batchConnect 的结果；不会在先收到失败后继续等待其他竞速连接。
+	// result 用于本次流程后续判断的结果
 	result := <-results
 	go func() {
 		defer cancel()
-		for i := 1; i < len(delays); i++ {
+		for // i 用于本次流程后续判断的i
+		i := 1; i < len(delays); i++ {
+			// late 用于本次流程后续判断的late
 			late := <-results
 			if late.conn != nil {
 				_ = late.conn.CloseNow()
@@ -241,10 +278,12 @@ func openBatch(ctx context.Context, target string, cfg Config, logger *slog.Logg
 	return newConn(result.conn, cfg, logger), nil
 }
 
+// newConn 封装newConn业务协调。
 func newConn(raw *websocket.Conn, cfg Config, logger *slog.Logger) *Conn {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// c 用于本次流程后续判断的c
 	c := &Conn{
 		ws:       raw,
 		cfg:      cfg,
@@ -256,6 +295,7 @@ func newConn(raw *websocket.Conn, cfg Config, logger *slog.Logger) *Conn {
 	return c
 }
 
+// ensureReadPump 封装ensureReadPump业务协调。
 func (c *Conn) ensureReadPump() {
 	c.initOnce.Do(func() {
 		if c.logger == nil {
@@ -276,6 +316,7 @@ func (c *Conn) Register(ctx context.Context, deviceID, accessToken string) error
 	// 官网 authConnect 在 _auth 前对 MTOP accessToken 执行
 	// decodeURIComponent。保留原始值供重试，再把解码值写入 /reg。
 	c.cfg.AccessToken = accessToken
+	// decodedAccessToken、err 用于本次流程后续判断的decodedAccessToken、err
 	decodedAccessToken, err := url.PathUnescape(accessToken)
 	if err != nil {
 		return fmt.Errorf("解码 WebSocket accessToken 失败: %w", err)
@@ -283,6 +324,7 @@ func (c *Conn) Register(ctx context.Context, deviceID, accessToken string) error
 	if !utf8.ValidString(decodedAccessToken) {
 		return fmt.Errorf("解码 WebSocket accessToken 失败: 非法 UTF-8")
 	}
+	// response、err 用于本次流程后续判断的response、err
 	response, err := c.request(ctx, "/reg", map[string]any{
 		"cache-header": "app-key token ua wv",
 		"app-key":      RegAppKey,
@@ -296,6 +338,7 @@ func (c *Conn) Register(ctx context.Context, deviceID, accessToken string) error
 	if err != nil {
 		return fmt.Errorf("等待 /reg 响应失败: %w", err)
 	}
+	// code、ok 用于本次流程后续判断的code、ok
 	code, ok := responseCode(response["code"])
 	if ok && code == 200 {
 		c.logger.Info("WS 注册完成")
@@ -309,7 +352,9 @@ func (c *Conn) register(ctx context.Context) error {
 	return c.Register(ctx, c.cfg.DeviceID, c.cfg.AccessToken)
 }
 
+// midKey 封装midKey业务协调。
 func midKey(mid string) string {
+	// fields 用于本次流程后续判断的字段列表
 	fields := strings.Fields(mid)
 	if len(fields) == 0 {
 		return ""
@@ -317,27 +362,35 @@ func midKey(mid string) string {
 	return fields[0]
 }
 
+// responseCode 封装响应Code业务协调。
 func responseCode(value any) (int, bool) {
-	switch code := value.(type) {
+	switch // code 用于本次流程后续判断的code
+	code := value.(type) {
 	case float64:
 		return int(code), true
 	case int:
 		return code, true
 	case json.Number:
+		// parsed、err 用于本次流程后续判断的parsed、err
 		parsed, err := code.Int64()
 		return int(parsed), err == nil
 	case string:
+		// parsed 用于本次流程后续判断的解析结果
 		var parsed int
-		if _, err := fmt.Sscanf(strings.TrimSpace(code), "%d", &parsed); err == nil {
+		if // err 用于本次流程后续判断的err
+		_, err := fmt.Sscanf(strings.TrimSpace(code), "%d", &parsed); err == nil {
 			return parsed, true
 		}
 	}
 	return 0, false
 }
 
+// request 封装请求业务协调。
 func (c *Conn) request(ctx context.Context, path string, headers map[string]any, body any, timeout time.Duration) (map[string]any, error) {
 	c.ensureReadPump()
+	// requestCtx 用于本次流程后续判断的请求Ctx
 	requestCtx := ctx
+	// cancel 用于本次流程后续判断的取消
 	cancel := func() {}
 	if timeout > 0 {
 		requestCtx, cancel = context.WithTimeout(ctx, timeout)
@@ -347,14 +400,18 @@ func (c *Conn) request(ctx context.Context, path string, headers map[string]any,
 	if headers == nil {
 		headers = make(map[string]any)
 	}
+	// mid 用于本次流程后续判断的mid
 	mid := strings.TrimSpace(fmt.Sprint(headers["mid"]))
 	if mid == "" || mid == "<nil>" {
 		mid = protocol.GenerateMid()
 		headers["mid"] = mid
 	}
+	// key 用于本次流程后续判断的key
 	key := midKey(mid)
+	// started 用于本次流程后续判断的started
 	started := time.Now()
 	c.logger.Debug("WS 请求发送", "path", path, "mid", key)
+	// responseCh 用于本次流程后续判断的响应Ch
 	responseCh := make(chan map[string]any, 1)
 	c.pendingMu.Lock()
 	c.pending[key] = responseCh
@@ -365,16 +422,20 @@ func (c *Conn) request(ctx context.Context, path string, headers map[string]any,
 		c.pendingMu.Unlock()
 	}()
 
+	// frame 用于本次流程后续判断的frame
 	frame := map[string]any{"lwp": path, "headers": headers}
 	if body != nil {
 		frame["body"] = body
 	}
-	if err := c.sendJSON(requestCtx, frame); err != nil {
+	if // err 用于本次流程后续判断的err
+	err := c.sendJSON(requestCtx, frame); err != nil {
 		c.logger.Warn("WS 请求发送失败", "path", path, "mid", key, "duration", time.Since(started).Round(time.Millisecond), "err", err)
 		return nil, err
 	}
 	select {
-	case response := <-responseCh:
+	case // response 用于本次流程后续判断的响应
+	response := <-responseCh:
+		// code 用于本次流程后续判断的code
 		code, _ := responseCode(response["code"])
 		c.logResponse(path, key, code, time.Since(started))
 		return response, nil
@@ -383,16 +444,20 @@ func (c *Conn) request(ctx context.Context, path string, headers map[string]any,
 		// following close. Prefer that already-resolved response over readDone,
 		// matching browser event ordering (message before close).
 		select {
-		case response := <-responseCh:
+		case // response 用于本次流程后续判断的响应
+		response := <-responseCh:
+			// code 用于本次流程后续判断的code
 			code, _ := responseCode(response["code"])
 			c.logResponse(path, key, code, time.Since(started))
 			return response, nil
 		default:
 		}
+		// err 用于本次流程后续判断的err
 		err := c.connectionReadError()
 		c.logger.Warn("WS 请求因连接结束失败", "path", path, "mid", key, "duration", time.Since(started).Round(time.Millisecond), "err", err)
 		return nil, err
 	case <-requestCtx.Done():
+		// err 用于本次流程后续判断的err
 		err := requestCtx.Err()
 		if errors.Is(err, context.Canceled) {
 			c.logger.Debug("WS 请求取消", "path", path, "mid", key, "duration", time.Since(started).Round(time.Millisecond), "err", err)
@@ -405,6 +470,7 @@ func (c *Conn) request(ctx context.Context, path string, headers map[string]any,
 
 // ListUserMessages retrieves one page of official IM history for a conversation.
 // The cursor is opaque to callers; zero selects the newest page.
+// ListUserMessages 读取用户消息列表。
 func (c *Conn) ListUserMessages(ctx context.Context, cid string, cursor int64, limit int) (map[string]any, error) {
 	cid = strings.TrimSpace(cid)
 	if cid == "" {
@@ -419,25 +485,30 @@ func (c *Conn) ListUserMessages(ctx context.Context, cid string, cursor int64, l
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
+	// response、err 用于本次流程后续判断的response、err
 	response, err := c.request(ctx, "/r/MessageManager/listUserMessages", nil,
 		[]any{cid, false, cursor, limit, false}, regResponseTimeout)
 	if err != nil {
 		return nil, err
 	}
-	if code, ok := responseCode(response["code"]); ok && code != http.StatusOK {
+	if // code、ok 用于本次流程后续判断的code、ok
+	code, ok := responseCode(response["code"]); ok && code != http.StatusOK {
 		return nil, fmt.Errorf("聊天历史接口返回状态 %d", code)
 	}
+	// body、ok 用于本次流程后续判断的body、ok
 	body, ok := response["body"].(map[string]any)
 	if !ok {
 		return nil, errors.New("聊天历史接口响应缺少 body")
 	}
-	if reason := strings.TrimSpace(fmt.Sprint(body["reason"])); reason != "" && reason != "<nil>" {
+	if // reason 用于本次流程后续判断的原因
+	reason := strings.TrimSpace(fmt.Sprint(body["reason"])); reason != "" && reason != "<nil>" {
 		return nil, fmt.Errorf("聊天历史接口失败: %s", reason)
 	}
 	return body, nil
 }
 
 // ListConversations retrieves one page of the account's official IM contacts.
+// ListConversations 读取Conversations。
 func (c *Conn) ListConversations(ctx context.Context, cursor int64, limit int) (map[string]any, error) {
 	if cursor <= 0 {
 		cursor = 9007199254740991
@@ -445,24 +516,30 @@ func (c *Conn) ListConversations(ctx context.Context, cursor int64, limit int) (
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
+	// response、err 用于本次流程后续判断的response、err
 	response, err := c.request(ctx, "/r/Conversation/listNewestPagination", nil, []any{cursor, limit}, regResponseTimeout)
 	if err != nil {
 		return nil, err
 	}
-	if code, ok := responseCode(response["code"]); ok && code != http.StatusOK {
+	if // code、ok 用于本次流程后续判断的code、ok
+	code, ok := responseCode(response["code"]); ok && code != http.StatusOK {
 		return nil, fmt.Errorf("会话列表接口返回状态 %d", code)
 	}
+	// body、ok 用于本次流程后续判断的body、ok
 	body, ok := response["body"].(map[string]any)
 	if !ok {
 		return nil, errors.New("会话列表接口响应缺少 body")
 	}
-	if reason := strings.TrimSpace(fmt.Sprint(body["reason"])); reason != "" && reason != "<nil>" {
+	if // reason 用于本次流程后续判断的原因
+	reason := strings.TrimSpace(fmt.Sprint(body["reason"])); reason != "" && reason != "<nil>" {
 		return nil, fmt.Errorf("会话列表接口失败: %s", reason)
 	}
 	return body, nil
 }
 
+// logResponse 封装log响应业务协调。
 func (c *Conn) logResponse(path, mid string, code int, duration time.Duration) {
+	// attrs 用于本次流程后续判断的attrs
 	attrs := []any{"path", path, "mid", mid, "code", code, "duration", duration.Round(time.Millisecond)}
 	if code >= 400 {
 		c.logger.Warn("WS 业务响应异常", attrs...)
@@ -471,9 +548,11 @@ func (c *Conn) logResponse(path, mid string, code int, duration time.Duration) {
 	c.logger.Debug("WS 响应收到", attrs...)
 }
 
+// readPump 封装readPump业务协调。
 func (c *Conn) readPump() {
 	defer close(c.readDone)
 	for {
+		// messageType、data、err 用于本次流程后续判断的消息Type、data、err
 		messageType, data, err := c.ws.Read(c.readCtx)
 		if err != nil {
 			c.readErrMu.Lock()
@@ -481,28 +560,37 @@ func (c *Conn) readPump() {
 			c.readErrMu.Unlock()
 			return
 		}
+		// parsed 用于本次流程后续判断的解析结果
 		var parsed map[string]any
-		if err := json.Unmarshal(data, &parsed); err != nil {
-			if recorder := c.recorderSnapshot(); recorder != nil {
+		if // err 用于本次流程后续判断的err
+		err := json.Unmarshal(data, &parsed); err != nil {
+			if // recorder 用于本次流程后续判断的recorder
+			recorder := c.recorderSnapshot(); recorder != nil {
 				recorder("in", string(data), "", "non_json", err.Error())
 			}
 			continue
 		}
 		c.recordParsedIncoming(data, parsed)
-		if _, hasCode := parsed["code"]; hasCode {
-			if _, hasHeaders := parsed["headers"].(map[string]any); hasHeaders {
+		if // hasCode 用于本次流程后续判断的hasCode
+		_, hasCode := parsed["code"]; hasCode {
+			if // hasHeaders 用于本次流程后续判断的hasHeaders
+			_, hasHeaders := parsed["headers"].(map[string]any); hasHeaders {
 				c.dispatchResponse(parsed)
 				continue
 			}
 		}
+		// lwp、hasLWP 用于本次流程后续判断的lwp、hasLWP
 		lwp, hasLWP := parsed["lwp"].(string)
+		// hasHeaders 用于本次流程后续判断的hasHeaders
 		_, hasHeaders := parsed["headers"].(map[string]any)
 		if !hasLWP || strings.TrimSpace(lwp) == "" || !hasHeaders {
-			if recorder := c.recorderSnapshot(); recorder != nil {
+			if // recorder 用于本次流程后续判断的recorder
+			recorder := c.recorderSnapshot(); recorder != nil {
 				recorder("in", string(data), string(data), "skip_invalid_lwp", "")
 			}
 			continue
 		}
+		// incoming 用于本次流程后续判断的incoming
 		incoming := incomingFrame{messageType: messageType, data: append([]byte(nil), data...), parsed: parsed}
 		select {
 		case c.pushes <- incoming:
@@ -512,10 +600,14 @@ func (c *Conn) readPump() {
 	}
 }
 
+// dispatchResponse 封装dispatch响应业务协调。
 func (c *Conn) dispatchResponse(frame map[string]any) bool {
+	// headers 用于本次流程后续判断的headers
 	headers, _ := frame["headers"].(map[string]any)
+	// key 用于本次流程后续判断的key
 	key := midKey(strings.TrimSpace(fmt.Sprint(headers["mid"])))
 	c.pendingMu.Lock()
+	// ch 用于本次流程后续判断的ch
 	ch := c.pending[key]
 	c.pendingMu.Unlock()
 	if ch == nil {
@@ -528,6 +620,7 @@ func (c *Conn) dispatchResponse(frame map[string]any) bool {
 	return true
 }
 
+// connectionReadError 封装connectionRead错误业务协调。
 func (c *Conn) connectionReadError() error {
 	c.readErrMu.Lock()
 	defer c.readErrMu.Unlock()
@@ -537,13 +630,17 @@ func (c *Conn) connectionReadError() error {
 	return fmt.Errorf("WebSocket 读取循环已结束")
 }
 
+// recordParsedIncoming 封装record解析结果Incoming业务协调。
 func (c *Conn) recordParsedIncoming(data []byte, parsed map[string]any) {
+	// recorder 用于本次流程后续判断的recorder
 	recorder := c.recorderSnapshot()
 	if recorder == nil {
 		return
 	}
+	// parsedJSON 用于本次流程后续判断的解析结果JSON
 	parsedJSON := string(data)
-	if normalized, err := json.Marshal(parsed); err == nil {
+	if // normalized、err 用于本次流程后续判断的normalized、err
+	normalized, err := json.Marshal(parsed); err == nil {
 		parsedJSON = string(normalized)
 	}
 	recorder("in", string(data), parsedJSON, "json", "")
@@ -552,12 +649,16 @@ func (c *Conn) recordParsedIncoming(data []byte, parsed map[string]any) {
 // HeartbeatLoop 对齐官网：注册后以固定 15 秒节拍发送 /!，即使上一请求仍在
 // 等待也不推迟下一次；任一请求失败或 30 秒无响应即结束连接。官网只以
 // Promise 是否 reject 判断心跳，不因已收到的非 200 响应主动断线。
+// HeartbeatLoop 封装HeartbeatLoop业务协调。
 func (c *Conn) HeartbeatLoop(ctx context.Context, interval time.Duration) error {
 	c.ensureReadPump()
+	// heartbeatCtx、cancel 用于本次流程后续判断的heartbeatCtx、cancel
 	heartbeatCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// ticker 用于本次流程后续判断的ticker
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// heartbeatErr 用于本次流程后续判断的heartbeatErr
 	heartbeatErr := make(chan error, 1)
 	for {
 		select {
@@ -565,11 +666,13 @@ func (c *Conn) HeartbeatLoop(ctx context.Context, interval time.Duration) error 
 			return heartbeatCtx.Err()
 		case <-c.readDone:
 			return c.connectionReadError()
-		case err := <-heartbeatErr:
+		case // err 用于本次流程后续判断的err
+		err := <-heartbeatErr:
 			_ = c.Close()
 			return fmt.Errorf("心跳响应失败: %w", err)
 		case <-ticker.C:
 			go func() {
+				// err 用于本次流程后续判断的err
 				_, err := c.request(heartbeatCtx, "/!", map[string]any{}, nil, heartbeatResponseTimeout)
 				if err == nil || heartbeatCtx.Err() != nil {
 					return
@@ -585,9 +688,11 @@ func (c *Conn) HeartbeatLoop(ctx context.Context, interval time.Duration) error 
 
 // ReceiveLoop 消费 readPump 分发的 Push。响应帧永远不会进入这里，因此不会被
 // 错误 ACK；Push ACK 原样复用服务端完整 headers。
+// ReceiveLoop 封装ReceiveLoop业务协调。
 func (c *Conn) ReceiveLoop(ctx context.Context, onMessage func(decrypted map[string]any)) error {
 	c.ensureReadPump()
 	for {
+		// frame 用于本次流程后续判断的frame
 		var frame incomingFrame
 		select {
 		case <-ctx.Done():
@@ -603,7 +708,9 @@ func (c *Conn) ReceiveLoop(ctx context.Context, onMessage func(decrypted map[str
 			}
 		case frame = <-c.pushes:
 		}
+		// raw 用于本次流程后续判断的原始
 		raw := frame.parsed
+		// rawText 用于本次流程后续判断的原始文本
 		rawText := string(frame.data)
 		switch strings.TrimSpace(fmt.Sprint(raw["lwp"])) {
 		case "/push/kickout":
@@ -618,7 +725,8 @@ func (c *Conn) ReceiveLoop(ctx context.Context, onMessage func(decrypted map[str
 		// 官网异步启动 sync state 恢复，并立即完成当前 Push handler；不能
 		// 为 getState/ackDiff 最多阻塞 Push ACK 60 秒。
 		go func(message map[string]any) {
-			if err := c.handleSyncExtra(c.readCtx, message); err != nil && c.readCtx.Err() == nil {
+			if // err 用于本次流程后续判断的err
+			err := c.handleSyncExtra(c.readCtx, message); err != nil && c.readCtx.Err() == nil {
 				c.logger.Error("同步状态恢复失败", "err", err)
 			}
 		}(raw)
@@ -627,22 +735,27 @@ func (c *Conn) ReceiveLoop(ctx context.Context, onMessage func(decrypted map[str
 		syncData, ok := extractSyncPayload(raw)
 		if !ok {
 			c.sendACK(ctx, raw)
-			if recorder := c.recorderSnapshot(); recorder != nil {
+			if // recorder 用于本次流程后续判断的recorder
+			recorder := c.recorderSnapshot(); recorder != nil {
 				recorder("in", rawText, "", "skip_non_sync", "")
 			}
 			continue
 		}
+		// decoded、err 用于本次流程后续判断的decoded、err
 		decoded, err := decodeSyncData(syncData)
 		if err != nil {
 			c.sendACK(ctx, raw)
-			if recorder := c.recorderSnapshot(); recorder != nil {
+			if // recorder 用于本次流程后续判断的recorder
+			recorder := c.recorderSnapshot(); recorder != nil {
 				recorder("in", rawText, "", "decrypt_failed", err.Error())
 			}
 			c.logger.Error("消息解密失败", "err", err)
 			continue
 		}
-		if recorder := c.recorderSnapshot(); recorder != nil {
-			if b, e := json.Marshal(decoded); e == nil {
+		if // recorder 用于本次流程后续判断的recorder
+		recorder := c.recorderSnapshot(); recorder != nil {
+			if // b、e 用于本次流程后续判断的b、e
+			b, e := json.Marshal(decoded); e == nil {
 				recorder("in", rawText, string(b), "decrypted", "")
 			}
 		}
@@ -653,221 +766,4 @@ func (c *Conn) ReceiveLoop(ctx context.Context, onMessage func(decrypted map[str
 	}
 }
 
-func (c *Conn) handleSyncExtra(ctx context.Context, msg map[string]any) error {
-	body, _ := msg["body"].(map[string]any)
-	extra, _ := body["syncExtraType"].(map[string]any)
-	typeCode, ok := responseCode(extra["type"])
-	if !ok || (typeCode != 1 && typeCode != 2) {
-		return nil
-	}
-	state, err := c.request(ctx, "/r/SyncStatus/getState", map[string]any{}, []any{map[string]any{"topic": "sync"}}, regResponseTimeout)
-	if err != nil {
-		return fmt.Errorf("getState: %w", err)
-	}
-	if code, ok := responseCode(state["code"]); !ok || code != http.StatusOK || state["body"] == nil {
-		return fmt.Errorf("getState 返回异常: code=%v", state["code"])
-	}
-	response, err := c.request(ctx, "/r/SyncStatus/ackDiff", map[string]any{}, []any{state["body"]}, regResponseTimeout)
-	if err != nil {
-		return fmt.Errorf("ackDiff: %w", err)
-	}
-	if code, ok := responseCode(response["code"]); ok && code != http.StatusOK {
-		return fmt.Errorf("ackDiff 返回异常: code=%d", code)
-	}
-	return nil
-}
-
-// sendACK 回复 {"code":200, headers:<服务端完整 headers>}。
-func (c *Conn) sendACK(ctx context.Context, msg map[string]any) {
-	headers, _ := msg["headers"].(map[string]any)
-	ackHeaders := make(map[string]any, len(headers))
-	for key, value := range headers {
-		ackHeaders[key] = value
-	}
-	ack := map[string]any{
-		"code":    200,
-		"headers": ackHeaders,
-	}
-	// ACK 失败不阻塞主循环。
-	ackCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	_ = c.sendJSON(ackCtx, ack)
-	cancel()
-}
-
-// extractSyncPayload 取出 body.syncPushPackage.data[0].data（字符串）。
-func extractSyncPayload(msg map[string]any) (string, bool) {
-	body, _ := msg["body"].(map[string]any)
-	if body == nil {
-		return "", false
-	}
-	pkg, _ := body["syncPushPackage"].(map[string]any)
-	if pkg == nil {
-		return "", false
-	}
-	arr, _ := pkg["data"].([]any)
-	if len(arr) == 0 {
-		return "", false
-	}
-	first, _ := arr[0].(map[string]any)
-	if first == nil {
-		return "", false
-	}
-	d, ok := first["data"].(string)
-	return d, ok && d != ""
-}
-
-// decodeSyncData 先尝试 base64+JSON（未加密系统消息），失败则 base64+msgpack 解密。
-func decodeSyncData(data string) (map[string]any, error) {
-	// 1) base64 解码后尝试解析 JSON。
-	if dec, err := base64.StdEncoding.DecodeString(data); err == nil {
-		var parsed map[string]any
-		if jsonErr := json.Unmarshal(dec, &parsed); jsonErr == nil {
-			return parsed, nil
-		}
-	}
-	// 2) JSON 解析失败 → msgpack 解密
-	out, err := protocol.Decrypt(data)
-	if err != nil {
-		return nil, err
-	}
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
-		return nil, fmt.Errorf("解密后非 JSON: %w", err)
-	}
-	return parsed, nil
-}
-
-// sendJSON 发送一条 JSON 文本帧。
-func (c *Conn) sendJSON(ctx context.Context, v any) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	if recorder := c.recorderSnapshot(); recorder != nil {
-		recorder("out", string(b), string(b), "json", "")
-	}
-	select {
-	case c.sendGate <- struct{}{}:
-		defer func() { <-c.sendGate }()
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	return c.ws.Write(ctx, websocket.MessageText, b)
-}
-
-// SendText 发送一条闲鱼聊天文本消息。
-func (c *Conn) SendText(ctx context.Context, myID, cid, toID, text string) error {
-	content := map[string]any{
-		"contentType": 1,
-		"text": map[string]any{
-			"text": text,
-		},
-	}
-	return c.sendChatContent(ctx, myID, cid, toID, content)
-}
-
-// MarkChatRead notifies the platform that the conversation was opened.
-func (c *Conn) MarkChatRead(ctx context.Context, cid string, messageIDs []map[string]any) error {
-	ids := make([]string, 0, len(messageIDs))
-	for _, item := range messageIDs {
-		if id := strings.TrimSpace(fmt.Sprint(item["messageId"])); id != "" && id != "<nil>" {
-			ids = append(ids, id)
-		}
-	}
-	c.logger.Info("准备上报闲鱼已读", "cid", cid, "message_count", len(ids), "message_ids", ids)
-	// MessageStatusService.read takes one argument: list<string> messageIds.
-	response, err := c.request(ctx, "/r/MessageStatus/read", map[string]any{}, []any{ids}, regResponseTimeout)
-	if err == nil {
-		if code, ok := responseCode(response["code"]); ok && code >= 400 {
-			c.logger.Warn("闲鱼已读上报被拒绝", "cid", cid, "message_count", len(ids), "code", code, "body", response["body"])
-		} else {
-			c.logger.Info("闲鱼已读上报成功", "cid", cid, "message_count", len(ids), "message_ids", ids, "code", response["code"])
-		}
-	}
-	return err
-}
-
-// SendImage 发送一条闲鱼聊天图片消息。imageURL 应为闲鱼可访问的 CDN/公网 URL。
-func (c *Conn) SendImage(ctx context.Context, myID, cid, toID, imageURL string, width, height int) error {
-	if width <= 0 {
-		width = 800
-	}
-	if height <= 0 {
-		height = 600
-	}
-	content := map[string]any{
-		"contentType": 2,
-		"image": map[string]any{
-			"pics": []map[string]any{{
-				"height": height,
-				"type":   0,
-				"url":    imageURL,
-				"width":  width,
-			}},
-		},
-	}
-	return c.sendChatContent(ctx, myID, cid, toID, content)
-}
-
-func (c *Conn) sendChatContent(ctx context.Context, myID, cid, toID string, content any) error {
-	myID = stripGoofish(myID)
-	cid = stripGoofish(cid)
-	toID = stripGoofish(toID)
-	if myID == "" || cid == "" || toID == "" {
-		return fmt.Errorf("发送消息缺少必要参数: myID=%q cid=%q toID=%q", myID, cid, toID)
-	}
-	raw, err := json.Marshal(content)
-	if err != nil {
-		return err
-	}
-	encoded := base64.StdEncoding.EncodeToString(raw)
-	msg := map[string]any{
-		"lwp": "/r/MessageSend/sendByReceiverScope",
-		"headers": map[string]any{
-			"mid": protocol.GenerateMid(),
-		},
-		"body": []any{
-			map[string]any{
-				"uuid":             protocol.GenerateUUID(),
-				"cid":              cid + "@goofish",
-				"conversationType": 1,
-				"content": map[string]any{
-					"contentType": 101,
-					"custom": map[string]any{
-						"type": 1,
-						"data": encoded,
-					},
-				},
-				"redPointPolicy": 0,
-				"extension": map[string]any{
-					"extJson": "{}",
-				},
-				"ctx": map[string]any{
-					"appVersion": "1.0",
-					"platform":   "web",
-				},
-				"mtags":                map[string]any{},
-				"msgReadStatusSetting": 1,
-			},
-			map[string]any{
-				"actualReceivers": []string{
-					toID + "@goofish",
-					myID + "@goofish",
-				},
-			},
-		},
-	}
-	return c.sendJSON(ctx, msg)
-}
-
-func stripGoofish(s string) string {
-	s = strings.TrimSpace(s)
-	return strings.TrimSuffix(s, "@goofish")
-}
-
-// Close 关闭连接。
-func (c *Conn) Close() error {
-	c.ensureReadPump()
-	c.readCancel()
-	return c.ws.Close(websocket.StatusNormalClosure, "bye")
-}
+// handleSyncExtra 封装handleSyncExtra业务协调。

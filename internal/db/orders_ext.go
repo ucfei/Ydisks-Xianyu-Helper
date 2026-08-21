@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
+	"time"
 )
 
 // OrderRow 订单列表展示行（含 item_title）。
@@ -45,33 +48,44 @@ func (o *Orders) ListForUser(ctx context.Context, f OrderListFilter) ([]OrderRow
 	if f.Limit <= 0 {
 		f.Limit = 20
 	}
+	// where 用于本次流程后续判断的where
 	where := []string{"c.user_id=?", "o.deleted_at IS NULL"}
+	// args 用于本次流程后续判断的args
 	args := []any{f.UserID}
 	if f.CookieID != "" {
 		where = append(where, "o.cookie_id=?")
 		args = append(args, f.CookieID)
 	}
-	if statuses := normalizedStatusCandidates(f.Status); len(statuses) > 0 {
+	if // statuses 用于本次流程后续判断的statuses
+	statuses := normalizedStatusCandidates(f.Status); len(statuses) > 0 {
+		// placeholders 用于本次流程后续判断的placeholders
 		placeholders := make([]string, 0, len(statuses))
+		// st 表示当前遍历过程中的st
 		for _, st := range statuses {
 			placeholders = append(placeholders, "?")
 			args = append(args, st)
 		}
 		where = append(where, "o.order_status IN ("+strings.Join(placeholders, ",")+")")
 	}
-	if search := strings.ToLower(strings.TrimSpace(f.Search)); search != "" {
+	if // search 用于本次流程后续判断的搜索
+	search := strings.ToLower(strings.TrimSpace(f.Search)); search != "" {
+		// pattern 用于本次流程后续判断的pattern
 		pattern := "%" + search + "%"
 		where = append(where, `(LOWER(o.order_id) LIKE ? OR LOWER(COALESCE(o.item_id,'')) LIKE ?
 			OR LOWER(COALESCE(o.buyer_id,'')) LIKE ? OR LOWER(COALESCE(i.item_title,'')) LIKE ?
 			OR LOWER(COALESCE(o.receiver_name,'')) LIKE ? OR LOWER(COALESCE(o.receiver_phone,'')) LIKE ?)`)
-		for i := 0; i < 6; i++ {
+		for // i 用于本次流程后续判断的i
+		i := 0; i < 6; i++ {
 			args = append(args, pattern)
 		}
 	}
+	// whereSQL 用于本次流程后续判断的whereSQL
 	whereSQL := strings.Join(where, " AND ")
 
+	// total 用于本次流程后续判断的总数
 	var total int
-	if err := o.DB.QueryRowContext(ctx,
+	if // err 用于本次流程后续判断的err
+	err := o.DB.QueryRowContext(ctx,
 		`SELECT COUNT(*)
 		   FROM orders o
 		   JOIN cookies c ON c.id=o.cookie_id
@@ -80,8 +94,10 @@ func (o *Orders) ListForUser(ctx context.Context, f OrderListFilter) ([]OrderRow
 		return nil, 0, err
 	}
 
+	// queryArgs 用于本次流程后续判断的查询Args
 	queryArgs := append([]any{}, args...)
 	queryArgs = append(queryArgs, f.Limit, f.Offset)
+	// rows、err 用于本次流程后续判断的rows、err
 	rows, err := o.DB.QueryContext(ctx,
 		`SELECT o.order_id, o.item_id, COALESCE(i.item_title,''), COALESCE(i.item_detail,''),
 		        o.buyer_id, o.spec_name, o.spec_value, o.quantity, o.amount,
@@ -98,12 +114,17 @@ func (o *Orders) ListForUser(ctx context.Context, f OrderListFilter) ([]OrderRow
 		return nil, 0, err
 	}
 	defer rows.Close()
+	// out 用于本次流程后续判断的out
 	out := []OrderRow{}
 	for rows.Next() {
+		// r 用于本次流程后续判断的r
 		var r OrderRow
+		// itemID、itemTitle、itemDetail、buyerID、specName、specValue、qty、amount、receiverName、receiverPhone、receiverAddr、receiverCity 保存商品ID、itemTitle、itemDetail、buyerID、specName、specValue、qty、amount、receiverName、receiverPhone、receiverAddr、receiverCity，供当前处理流程使用
 		var itemID, itemTitle, itemDetail, buyerID, specName, specValue, qty, amount, receiverName, receiverPhone, receiverAddr, receiverCity sql.NullString
+		// isBargain、sysShipped 用于本次流程后续判断的isBargain、sysShipped
 		var isBargain, sysShipped int
-		if err := rows.Scan(&r.OrderID, &itemID, &itemTitle, &itemDetail, &buyerID, &specName, &specValue, &qty, &amount,
+		if // err 用于本次流程后续判断的err
+		err := rows.Scan(&r.OrderID, &itemID, &itemTitle, &itemDetail, &buyerID, &specName, &specValue, &qty, &amount,
 			&r.OrderStatus, &r.CookieID, &isBargain, &sysShipped, &receiverName, &receiverPhone, &receiverAddr,
 			&receiverCity, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, 0, err
@@ -127,6 +148,7 @@ func (o *Orders) ListForUser(ctx context.Context, f OrderListFilter) ([]OrderRow
 	return out, total, rows.Err()
 }
 
+// normalizedStatusCandidates 封装normalized状态Candidates业务协调。
 func normalizedStatusCandidates(status string) []string {
 	status = strings.TrimSpace(status)
 	if status == "" || status == "all" {
@@ -168,6 +190,7 @@ func (o *Orders) ByCookiePage(ctx context.Context, cookieID string, limit, offse
 	if offset < 0 {
 		offset = 0
 	}
+	// rows、err 用于本次流程后续判断的rows、err
 	rows, err := o.DB.QueryContext(ctx,
 		`SELECT order_id, item_id, buyer_id, spec_name, spec_value, quantity, amount,
 		        order_status, is_bargain, system_shipped, receiver_name, receiver_phone,
@@ -177,12 +200,61 @@ func (o *Orders) ByCookiePage(ctx context.Context, cookieID string, limit, offse
 		return nil, err
 	}
 	defer rows.Close()
+	return scanOrderRows(rows, cookieID)
+}
+
+// ByCookieCursor 使用 created_at 与 order_id 复合游标扫描账号订单，避免大 OFFSET 的线性跳过成本。
+func (o *Orders) ByCookieCursor(ctx context.Context, cookieID string, limit int, afterCreatedAt, afterOrderID string) ([]OrderRow, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	// query 保存按复合游标扫描订单的 SQL。
+	query := `SELECT order_id, item_id, buyer_id, spec_name, spec_value, quantity, amount,
+		        order_status, is_bargain, system_shipped, receiver_name, receiver_phone,
+		        receiver_address, receiver_city, created_at, updated_at
+		 FROM orders WHERE cookie_id=? AND deleted_at IS NULL`
+	// args 保存游标查询参数。
+	args := []any{cookieID}
+	if afterCreatedAt != "" || afterOrderID != "" {
+		// cursorCreatedAt 将驱动层返回的 RFC3339 时间还原为数据库通用的时间文本格式。
+		cursorCreatedAt := normalizeOrderCursorTime(afterCreatedAt)
+		query += ` AND (created_at < ? OR (created_at = ? AND order_id < ?))`
+		args = append(args, cursorCreatedAt, cursorCreatedAt, afterOrderID)
+	}
+	query += ` ORDER BY created_at DESC,order_id DESC LIMIT ?`
+	args = append(args, limit)
+	// rows、err 保存游标查询结果及错误。
+	rows, err := o.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanOrderRows(rows, cookieID)
+}
+
+// normalizeOrderCursorTime 将订单行时间转换为跨数据库可比较的 UTC 文本。
+func normalizeOrderCursorTime(value string) string {
+	// parsed 表示驱动层返回的标准时间值。
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err == nil {
+		return parsed.UTC().Format("2006-01-02 15:04:05.999999999")
+	}
+	return strings.Replace(strings.TrimSuffix(value, "Z"), "T", " ", 1)
+}
+
+// scanOrderRows 将订单查询行转换为统一的订单列表模型。
+func scanOrderRows(rows *sql.Rows, cookieID string) ([]OrderRow, error) {
+	// out 用于本次流程后续判断的out
 	var out []OrderRow
 	for rows.Next() {
+		// r 用于本次流程后续判断的r
 		var r OrderRow
+		// itemID、buyerID、specName、specValue、qty、amount、receiverName、receiverPhone、receiverAddr、receiverCity 保存商品ID、buyerID、specName、specValue、qty、amount、receiverName、receiverPhone、receiverAddr、receiverCity，供当前处理流程使用
 		var itemID, buyerID, specName, specValue, qty, amount, receiverName, receiverPhone, receiverAddr, receiverCity sql.NullString
+		// isBargain、sysShipped 用于本次流程后续判断的isBargain、sysShipped
 		var isBargain, sysShipped int
-		if err := rows.Scan(&r.OrderID, &itemID, &buyerID, &specName, &specValue, &qty, &amount,
+		if // err 用于本次流程后续判断的err
+		err := rows.Scan(&r.OrderID, &itemID, &buyerID, &specName, &specValue, &qty, &amount,
 			&r.OrderStatus, &isBargain, &sysShipped, &receiverName, &receiverPhone, &receiverAddr,
 			&receiverCity, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
@@ -207,50 +279,44 @@ func (o *Orders) ByCookiePage(ctx context.Context, cookieID string, limit, offse
 
 // SoftDeleteMissingForCookie 将本次完整卖家订单同步中未出现的本地订单逻辑删除。
 // activeIDs 为空表示线上已确认没有任何卖家订单；调用方必须确保同步完整成功后再调用。
+// SoftDeleteMissingForCookie 封装SoftDeleteMissingFor登录凭证业务协调。
 func (o *Orders) SoftDeleteMissingForCookie(ctx context.Context, cookieID string, activeIDs map[string]struct{}) (int, error) {
 	if strings.TrimSpace(cookieID) == "" {
 		return 0, errors.New("cookie_id 不能为空")
 	}
-	rows, err := o.DB.QueryContext(ctx,
-		`SELECT order_id FROM orders WHERE cookie_id=? AND deleted_at IS NULL`, cookieID)
+	// args 保存批量 UPDATE 的参数，首个参数是账号 ID。
+	args := []any{cookieID}
+	// query 保存批量逻辑删除 SQL。
+	query := `UPDATE orders SET deleted_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+		WHERE cookie_id=? AND deleted_at IS NULL`
+	if len(activeIDs) > 0 {
+		// activeOrderIDs 按稳定顺序保存线上仍存在的订单 ID，便于日志和测试复现。
+		activeOrderIDs := make([]string, 0, len(activeIDs))
+		// orderID 表示当前线上仍存在的订单标识。
+		for orderID := range activeIDs {
+			activeOrderIDs = append(activeOrderIDs, orderID)
+		}
+		sort.Strings(activeOrderIDs)
+		// placeholders 保存 NOT IN 子句所需的占位符。
+		placeholders := make([]string, len(activeOrderIDs))
+		// i、orderID 分别表示占位符序号和线上订单标识。
+		for i, orderID := range activeOrderIDs {
+			placeholders[i] = "?"
+			args = append(args, orderID)
+		}
+		query += ` AND order_id NOT IN (` + strings.Join(placeholders, ",") + `)`
+	}
+	// result、err 保存批量逻辑删除结果及错误。
+	result, err := o.DB.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}
-	orderIDs := make([]string, 0)
-	for rows.Next() {
-		var orderID string
-		if err := rows.Scan(&orderID); err != nil {
-			_ = rows.Close()
-			return 0, err
-		}
-		orderIDs = append(orderIDs, orderID)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
+	// deleted 保存本次批量逻辑删除的订单数量。
+	deleted, err := result.RowsAffected()
+	if err != nil {
 		return 0, err
 	}
-	if err := rows.Close(); err != nil {
-		return 0, err
-	}
-
-	deleted := 0
-	for _, orderID := range orderIDs {
-		if _, ok := activeIDs[orderID]; ok {
-			continue
-		}
-		result, err := o.DB.ExecContext(ctx, `UPDATE orders
-			SET deleted_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-			WHERE cookie_id=? AND order_id=? AND deleted_at IS NULL`, cookieID, orderID)
-		if err != nil {
-			return deleted, err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return deleted, err
-		}
-		deleted += int(changed)
-	}
-	return deleted, nil
+	return int(deleted), nil
 }
 
 // OrderStatusMap 将数字状态码转换为文本状态。
@@ -263,7 +329,8 @@ var OrderStatusMap = map[string]string{
 
 // NormalizeOrderStatus 数字码归一为文本。
 func NormalizeOrderStatus(s string) string {
-	if t, ok := OrderStatusMap[s]; ok {
+	if // t、ok 用于本次流程后续判断的t、ok
+	t, ok := OrderStatusMap[s]; ok {
 		return t
 	}
 	if s == "" {
@@ -274,15 +341,19 @@ func NormalizeOrderStatus(s string) string {
 
 // AllTitles 取全部 item_id → item_title 映射（订单列表用）。
 func (i *Items) AllTitles(ctx context.Context) (map[string]string, error) {
+	// rows、err 用于本次流程后续判断的rows、err
 	rows, err := i.DB.QueryContext(ctx, `SELECT item_id, item_title FROM item_info`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	// m 用于本次流程后续判断的m
 	m := make(map[string]string)
 	for rows.Next() {
+		// id、title 用于本次流程后续判断的id、title
 		var id, title sql.NullString
-		if err := rows.Scan(&id, &title); err != nil {
+		if // err 用于本次流程后续判断的err
+		err := rows.Scan(&id, &title); err != nil {
 			return nil, err
 		}
 		m[id.String] = title.String
@@ -294,27 +365,42 @@ func (i *Items) AllTitles(ctx context.Context) (map[string]string, error) {
 
 // CardFull 卡券完整信息（CRUD 用）。
 type CardFull struct {
-	ID           int64  `json:"id"`
-	Name         string `json:"name"`
-	Type         string `json:"type"`
-	APIConfig    string `json:"api_config"`
-	TextContent  string `json:"text_content"`
-	DataContent  string `json:"data_content"`
-	ImageURL     string `json:"image_url"`
-	Description  string `json:"description"`
-	Enabled      bool   `json:"enabled"`
-	DelaySeconds int    `json:"delay_seconds"`
-	IsMultiSpec  bool   `json:"is_multi_spec"`
-	SpecName     string `json:"spec_name"`
-	SpecValue    string `json:"spec_value"`
-	UserID       int64  `json:"user_id"`
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	APIConfig string `json:"api_config"`
+	// APIConfigSummary 是脱敏查询路径使用的摘要；数据库层不会把完整模板交给上层。
+	APIConfigSummary *CardAPIConfigSummary `json:"-"`
+	TextContent      string                `json:"text_content"`
+	DataContent      string                `json:"data_content"`
+	ImageURL         string                `json:"image_url"`
+	Description      string                `json:"description"`
+	Enabled          bool                  `json:"enabled"`
+	DelaySeconds     int                   `json:"delay_seconds"`
+	IsMultiSpec      bool                  `json:"is_multi_spec"`
+	SpecName         string                `json:"spec_name"`
+	SpecValue        string                `json:"spec_value"`
+	UserID           int64                 `json:"user_id"`
+}
+
+// ExistsOwned 判断卡密组是否属于指定用户。
+func (c *Cards) ExistsOwned(ctx context.Context, cardID, userID int64) (bool, error) {
+	// exists 用于本次流程后续判断的exists
+	var exists bool
+	// err 用于本次流程后续判断的err
+	err := c.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM cards WHERE id=? AND user_id=?)`, cardID, userID).Scan(&exists)
+	return exists, err
 }
 
 // Get 取单个卡券。
 func (c *Cards) Get(ctx context.Context, cardID int64) (*CardFull, error) {
+	// cf 用于本次流程后续判断的cf
 	var cf CardFull
+	// enabled、isMultiSpec 用于本次流程后续判断的enabled、isMultiSpec
 	var enabled, isMultiSpec int
+	// apiCfg、textContent、dataContent、imageURL、specName、specValue、desc 用于本次流程后续判断的apiCfg、textContent、dataContent、imageURL、specName、specValue、desc
 	var apiCfg, textContent, dataContent, imageURL, specName, specValue, desc sql.NullString
+	// err 用于本次流程后续判断的err
 	err := c.DB.QueryRowContext(ctx,
 		`SELECT id, name, type, api_config, text_content, data_content, image_url, description,
 		        enabled, delay_seconds, is_multi_spec, spec_name, spec_value, user_id
@@ -327,7 +413,9 @@ func (c *Cards) Get(ctx context.Context, cardID int64) (*CardFull, error) {
 		}
 		return nil, err
 	}
-	cf.APIConfig = apiCfg.String
+	if cf.APIConfig, err = c.decryptAPIConfig(cf.Type, cf.UserID, apiCfg.String); err != nil {
+		return nil, err
+	}
 	cf.TextContent = textContent.String
 	cf.DataContent = dataContent.String
 	cf.ImageURL = imageURL.String
@@ -341,6 +429,7 @@ func (c *Cards) Get(ctx context.Context, cardID int64) (*CardFull, error) {
 
 // AllForUser 取某用户全部卡券。
 func (c *Cards) AllForUser(ctx context.Context, userID int64) ([]CardFull, error) {
+	// rows、err 用于本次流程后续判断的rows、err
 	rows, err := c.DB.QueryContext(ctx,
 		`SELECT id, name, type, api_config, text_content, data_content, image_url, description,
 		        enabled, delay_seconds, is_multi_spec, spec_name, spec_value, user_id
@@ -349,16 +438,23 @@ func (c *Cards) AllForUser(ctx context.Context, userID int64) ([]CardFull, error
 		return nil, err
 	}
 	defer rows.Close()
+	// out 用于本次流程后续判断的out
 	var out []CardFull
 	for rows.Next() {
+		// cf 用于本次流程后续判断的cf
 		var cf CardFull
+		// enabled、isMultiSpec 用于本次流程后续判断的enabled、isMultiSpec
 		var enabled, isMultiSpec int
+		// apiCfg、textContent、dataContent、imageURL、specName、specValue、desc 用于本次流程后续判断的apiCfg、textContent、dataContent、imageURL、specName、specValue、desc
 		var apiCfg, textContent, dataContent, imageURL, specName, specValue, desc sql.NullString
-		if err := rows.Scan(&cf.ID, &cf.Name, &cf.Type, &apiCfg, &textContent, &dataContent, &imageURL, &desc,
+		if // err 用于本次流程后续判断的err
+		err := rows.Scan(&cf.ID, &cf.Name, &cf.Type, &apiCfg, &textContent, &dataContent, &imageURL, &desc,
 			&enabled, &cf.DelaySeconds, &isMultiSpec, &specName, &specValue, &cf.UserID); err != nil {
 			return nil, err
 		}
-		cf.APIConfig = apiCfg.String
+		if cf.APIConfig, err = c.decryptAPIConfig(cf.Type, cf.UserID, apiCfg.String); err != nil {
+			return nil, err
+		}
 		cf.TextContent = textContent.String
 		cf.DataContent = dataContent.String
 		cf.ImageURL = imageURL.String
@@ -374,33 +470,62 @@ func (c *Cards) AllForUser(ctx context.Context, userID int64) ([]CardFull, error
 
 // Create 创建卡券，返回新 ID。
 func (c *Cards) Create(ctx context.Context, cf *CardFull) (int64, error) {
+	// apiConfig 保存写入数据库前按用户所有权加密后的 API 请求模板。
+	apiConfig, err := c.encryptAPIConfig(cf.Type, cf.UserID, cf.APIConfig)
+	if err != nil {
+		return 0, err
+	}
 	return insertReturningID(ctx, c.DB, c.Dialect,
 		`INSERT INTO cards (name, type, api_config, text_content, data_content, image_url, description,
 		    enabled, delay_seconds, is_multi_spec, spec_name, spec_value, user_id)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		cf.Name, cf.Type, nullable(cf.APIConfig), nullable(cf.TextContent), nullable(cf.DataContent),
+		cf.Name, cf.Type, nullable(apiConfig), nullable(cf.TextContent), nullable(cf.DataContent),
 		nullable(cf.ImageURL), nullable(cf.Description), boolToInt(cf.Enabled), cf.DelaySeconds,
 		boolToInt(cf.IsMultiSpec), nullable(cf.SpecName), nullable(cf.SpecValue), cf.UserID)
 }
 
 // Update 更新卡券。
 func (c *Cards) Update(ctx context.Context, cf *CardFull) error {
-	_, err := c.DB.ExecContext(ctx,
+	// apiConfig 保存更新写入数据库前按用户所有权加密后的 API 请求模板。
+	apiConfig, err := c.encryptAPIConfig(cf.Type, cf.UserID, cf.APIConfig)
+	if err != nil {
+		return err
+	}
+	// err 用于本次流程后续判断的err
+	_, err = c.DB.ExecContext(ctx,
 		`UPDATE cards SET name=?, type=?, api_config=?, text_content=?, data_content=?, image_url=?,
 		    description=?, enabled=?, delay_seconds=?, is_multi_spec=?, spec_name=?, spec_value=?, updated_at=CURRENT_TIMESTAMP
 		 WHERE id=?`,
-		cf.Name, cf.Type, nullable(cf.APIConfig), nullable(cf.TextContent), nullable(cf.DataContent),
+		cf.Name, cf.Type, nullable(apiConfig), nullable(cf.TextContent), nullable(cf.DataContent),
 		nullable(cf.ImageURL), nullable(cf.Description), boolToInt(cf.Enabled), cf.DelaySeconds,
 		boolToInt(cf.IsMultiSpec), nullable(cf.SpecName), nullable(cf.SpecValue), cf.ID)
 	return err
 }
 
+// encryptAPIConfig 仅对 API 卡券的完整请求模板做静态加密，其他卡券类型保持原有存储语义。
+func (c *Cards) encryptAPIConfig(cardType string, userID int64, value string) (string, error) {
+	if strings.ToLower(strings.TrimSpace(cardType)) != "api" || strings.TrimSpace(value) == "" {
+		return value, nil
+	}
+	return c.codec.encrypt(cardAPIConfigScope, fmt.Sprint(userID), value)
+}
+
+// decryptAPIConfig 读取完整 API 卡券配置；数据库密钥错误时拒绝继续执行自动化。
+func (c *Cards) decryptAPIConfig(cardType string, userID int64, value string) (string, error) {
+	if strings.ToLower(strings.TrimSpace(cardType)) != "api" || strings.TrimSpace(value) == "" {
+		return value, nil
+	}
+	return c.codec.decrypt(cardAPIConfigScope, fmt.Sprint(userID), value)
+}
+
 // Delete 删除卡券。
 func (c *Cards) Delete(ctx context.Context, cardID int64) error {
+	// err 用于本次流程后续判断的err
 	_, err := c.DB.ExecContext(ctx, `DELETE FROM cards WHERE id=?`, cardID)
 	return err
 }
 
+// nullable 封装nullable业务协调。
 func nullable(s string) any {
 	if s == "" {
 		return nil

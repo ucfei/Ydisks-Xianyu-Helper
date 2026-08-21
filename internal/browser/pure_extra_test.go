@@ -10,20 +10,25 @@ import (
 
 // TestSanitize 特殊字符替换为下划线（用于 userDataDir 命名）。
 func TestSanitize(t *testing.T) {
+	// cases 用于本次流程后续判断的cases
 	cases := map[string]string{
 		"acc_1":     "acc_1",
 		"acc/1:2 3": "acc_1_2_3",
 		`a\b:c d`:   "a_b_c_d",
 		"":          "",
 	}
+	// in、want 表示当前遍历过程中的in、want
 	for in, want := range cases {
-		if got := sanitize(in); got != want {
+		if // got 用于本次流程后续判断的got
+		got := sanitize(in); got != want {
 			t.Errorf("sanitize(%q)=%q want %q", in, got, want)
 		}
 	}
 }
 
+// TestPureUserIDMatchesReferenceRule 封装TestPure用户IDMatchesReference规则业务协调。
 func TestPureUserIDMatchesReferenceRule(t *testing.T) {
+	// cases 用于本次流程后续判断的cases
 	cases := map[string]string{
 		"foo_1234567890":     "foo",
 		"foo_bar_1234567890": "foo_bar",
@@ -32,13 +37,16 @@ func TestPureUserIDMatchesReferenceRule(t *testing.T) {
 		"":                   "unknown",
 		"foo/bar_1234567890": "foo_bar",
 	}
+	// in、want 表示当前遍历过程中的in、want
 	for in, want := range cases {
-		if got := pureUserID(in); got != want {
+		if // got 用于本次流程后续判断的got
+		got := pureUserID(in); got != want {
 			t.Fatalf("pureUserID(%q)=%q want %q", in, got, want)
 		}
 	}
 }
 
+// TestQuickRenewHeadlessUsesArgumentUnlessEnvOverrides 封装TestQuickRenewHeadlessUsesArgumentUnlessEnvOverrides业务协调。
 func TestQuickRenewHeadlessUsesArgumentUnlessEnvOverrides(t *testing.T) {
 	t.Setenv("BROWSER_HEADLESS", "")
 	if !quickRenewHeadless(true) {
@@ -57,6 +65,7 @@ func TestQuickRenewHeadlessUsesArgumentUnlessEnvOverrides(t *testing.T) {
 	}
 }
 
+// TestResolveHeadlessUsesShowBrowserConsistently 封装TestResolveHeadlessUsesShow浏览器Consistently业务协调。
 func TestResolveHeadlessUsesShowBrowserConsistently(t *testing.T) {
 	t.Setenv("BROWSER_HEADLESS", "")
 	if !ResolveHeadless(false) {
@@ -75,6 +84,7 @@ func TestResolveHeadlessUsesShowBrowserConsistently(t *testing.T) {
 	}
 }
 
+// TestCookiesRefreshHeadlessUsesAccountPreference 封装TestCookiesRefreshHeadlessUses账号Preference业务协调。
 func TestCookiesRefreshHeadlessUsesAccountPreference(t *testing.T) {
 	t.Setenv("BROWSER_HEADLESS", "")
 	if !cookiesRefreshHeadless(true) {
@@ -89,18 +99,21 @@ func TestCookiesRefreshHeadlessUsesAccountPreference(t *testing.T) {
 	}
 }
 
+// TestChromiumExecutablePathFromEnv 封装TestChromiumExecutable路径FromEnv业务协调。
 func TestChromiumExecutablePathFromEnv(t *testing.T) {
 	t.Setenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "")
 	if chromiumExecutablePath() != nil {
 		t.Fatal("未设置 PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH 时应返回 nil")
 	}
 	t.Setenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", " /usr/bin/chromium ")
+	// got 用于本次流程后续判断的got
 	got := chromiumExecutablePath()
 	if got == nil || *got != "/usr/bin/chromium" {
 		t.Fatalf("chromiumExecutablePath=%v", got)
 	}
 }
 
+// TestCaptchaIgnoreCertificateErrors 验证证书例外仅在明确环境开关为真时进入浏览器启动参数。
 func TestCaptchaIgnoreCertificateErrors(t *testing.T) {
 	t.Setenv("CAPTCHA_IGNORE_CERT_ERRORS", "")
 	if captchaIgnoreCertificateErrors() {
@@ -116,7 +129,51 @@ func TestCaptchaIgnoreCertificateErrors(t *testing.T) {
 	}
 }
 
+// TestCaptchaBrowserProxy 验证验证码浏览器只接受无凭证的受限代理地址，并在配置为空或非法时保留系统代理行为。
+func TestCaptchaBrowserProxy(t *testing.T) {
+	// testCases 是输入环境值与预期解析结果，覆盖默认、支持协议及敏感/危险输入。
+	testCases := []struct {
+		// name 是失败时定位具体输入的用例名。
+		name string
+		// value 是待解析的 CAPTCHA 浏览器代理配置。
+		value string
+		// want 是允许传给 Chromium 的预期代理地址，空串代表不追加覆盖参数。
+		want string
+	}{
+		{name: "empty", value: "", want: ""},
+		{name: "http", value: " http://127.0.0.1:1082 ", want: "http://127.0.0.1:1082"},
+		{name: "socks5", value: "socks5://127.0.0.1:1080", want: "socks5://127.0.0.1:1080"},
+		{name: "credentials", value: "http://user:secret@127.0.0.1:1082", want: ""},
+		{name: "query", value: "http://127.0.0.1:1082?secret=value", want: ""},
+		{name: "unsupported", value: "file:///tmp/proxy", want: ""},
+	}
+	// testCase 是当前要通过独立环境变量验证的代理配置用例。
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("CAPTCHA_BROWSER_PROXY", testCase.value)
+			// got 是解析后允许写入 Chromium 参数的代理地址。
+			got := captchaBrowserProxy()
+			if got != testCase.want {
+				t.Fatalf("captchaBrowserProxy()=%q, want %q", got, testCase.want)
+			}
+		})
+	}
+	t.Setenv("CAPTCHA_BROWSER_PROXY", "http://127.0.0.1:1082")
+	// proxyArgs 是显式代理启用时主 Chromium 引擎的启动参数集合。
+	proxyArgs := strings.Join(chromiumLaunchArgs(), " ")
+	if !strings.Contains(proxyArgs, "--proxy-server=http://127.0.0.1:1082") {
+		t.Fatalf("主引擎未写入显式代理参数: %s", proxyArgs)
+	}
+	// fallbackArgs 是备用直接 CDP 引擎的独立参数集合，必须使用相同代理而不是回退到 Fake-IP 直连。
+	fallbackArgs := strings.Join(fallbackChromiumArgs("/tmp/profile", true), " ")
+	if !strings.Contains(fallbackArgs, "--proxy-server=http://127.0.0.1:1082") {
+		t.Fatalf("备用引擎未写入显式代理参数: %s", fallbackArgs)
+	}
+}
+
+// TestNormalizeBrowserFingerprintRemovesOnlyHeadlessMarker 验证规范化不伪造 Chromium 的版本或平台身份。
 func TestNormalizeBrowserFingerprintRemovesOnlyHeadlessMarker(t *testing.T) {
+	// fingerprint 是含无头标记的实测身份经过规范化后的结果，用于断言只移除产品标记。
 	fingerprint := normalizeBrowserFingerprint(xianyu.BrowserFingerprint{
 		UserAgent: " Mozilla/5.0 HeadlessChrome/149.0.7827.55 Safari/537.36 ",
 		SecChUA:   `"HeadlessChrome";v="149", "Chromium";v="149"`,
@@ -137,7 +194,9 @@ func TestNormalizeBrowserFingerprintRemovesOnlyHeadlessMarker(t *testing.T) {
 	}
 }
 
+// TestNormalizeUserAgentMetadataRemovesAndDeduplicatesHeadlessBrand 验证导航前 CDP 覆盖不会泄露无头品牌。
 func TestNormalizeUserAgentMetadataRemovesAndDeduplicatesHeadlessBrand(t *testing.T) {
+	// metadata 是模拟页面返回的 Client Hints 经规范化后的副本，不应再暴露无头品牌。
 	metadata := normalizeUserAgentMetadata(map[string]any{
 		"brands": []any{
 			map[string]any{"brand": "HeadlessChrome", "version": "149"},
@@ -154,24 +213,30 @@ func TestNormalizeUserAgentMetadataRemovesAndDeduplicatesHeadlessBrand(t *testin
 	if strings.Contains(strings.ToLower(fmt.Sprint(metadata)), "headless") {
 		t.Fatalf("User-Agent metadata 仍暴露 headless: %#v", metadata)
 	}
+	// brands 是规范化后的基础品牌列表；ok 表示 CDP 可接收数组结构。
 	brands, ok := metadata["brands"].([]any)
 	if !ok || len(brands) != 2 {
 		t.Fatalf("brands 未正确去重: %#v", metadata["brands"])
 	}
+	// fullVersions 是规范化后的完整版本品牌列表；ok 表示字段没有被意外改变类型。
 	fullVersions, ok := metadata["fullVersionList"].([]any)
 	if !ok || len(fullVersions) != 1 {
 		t.Fatalf("fullVersionList 未正确去重: %#v", metadata["fullVersionList"])
 	}
 }
 
+// TestManagerHeadlessUserAgentUsesDetectedRuntimeVersion 验证无头 UA 沿用实测 Chromium 版本而非静态伪造值。
 func TestManagerHeadlessUserAgentUsesDetectedRuntimeVersion(t *testing.T) {
+	// m 模拟已完成运行时指纹探测的管理器，不需要启动真实 Chromium。
 	m := &Manager{browserFingerprint: xianyu.BrowserFingerprint{UserAgent: "Mozilla/5.0 HeadlessChrome/149.0.7827.55 Safari/537.36"}}
+	// userAgent 是 m 基于实测版本生成的无头 UA，应只替换产品标记。
 	userAgent := m.headlessUserAgent()
 	if userAgent == nil || *userAgent != "Mozilla/5.0 Chrome/149.0.7827.55 Safari/537.36" {
 		t.Fatalf("headlessUserAgent=%v", userAgent)
 	}
 }
 
+// TestSkipPlaywrightBrowserDownloadFromEnv 验证打包运行时可显式禁止 Playwright 下载新的浏览器。
 func TestSkipPlaywrightBrowserDownloadFromEnv(t *testing.T) {
 	t.Setenv("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "")
 	if skipPlaywrightBrowserDownload() {

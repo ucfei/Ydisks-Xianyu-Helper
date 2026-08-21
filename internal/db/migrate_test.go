@@ -11,17 +11,23 @@ import (
 
 // TestMigrate_AppliesCleanSchema 在临时库上跑迁移，验证全量 schema 干净落地、
 // 关键不一致列（orders.system_shipped 等）存在、默认设置就位。
+// TestMigrate_AppliesCleanSchema 封装TestMigrateAppliesCleanSchema业务协调。
 func TestMigrate_AppliesCleanSchema(t *testing.T) {
+	// tmp 用于本次流程后续判断的tmp
 	tmp := t.TempDir()
+	// dbPath 用于本次流程后续判断的db路径
 	dbPath := filepath.Join(tmp, "test.db")
 
+	// ctx 用于本次流程后续判断的ctx
 	ctx := context.Background()
+	// db、err 用于本次流程后续判断的db、err
 	db, _, err := Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
 
+	// checks 用于本次流程后续判断的checks
 	checks := []struct {
 		table string
 		col   string
@@ -58,7 +64,11 @@ func TestMigrate_AppliesCleanSchema(t *testing.T) {
 		{"risk_control_logs", "processing_status"},
 		{"risk_control_logs", "duration_ms"},
 		{"notification_outbox", "worker_token"},
+		{"order_reconciliations", "idempotency_key"},
+		{"security_audit_logs", "keys_json"},
+		{"security_audit_logs", "outcome"},
 	}
+	// c 表示当前遍历过程中的c
 	for _, c := range checks {
 		if !columnExists(t, db, c.table, c.col) {
 			t.Errorf("列缺失: %s.%s（应为收敛后的最终 schema）", c.table, c.col)
@@ -88,6 +98,7 @@ func TestMigrate_AppliesCleanSchema(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+	// db2、err 用于本次流程后续判断的db2、err
 	db2, _, err := Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("二次 Open 幂等失败: %v", err)
@@ -95,16 +106,70 @@ func TestMigrate_AppliesCleanSchema(t *testing.T) {
 	db2.Close()
 }
 
+// TestMigrate_UpgradesDatabaseWithMainChatVersions 验证已发布 main 的 00029/00030
+// 聊天迁移可以原样升级到包含快捷回复和买家备注的 00036 最终版本。
+func TestMigrate_UpgradesDatabaseWithMainChatVersions(t *testing.T) {
+	// tmpDir 保存隔离的已发布 main 数据库目录，测试结束后由 testing 清理。
+	tmpDir := t.TempDir()
+	// dbPath 指向模拟已运行至 main 00030 的 SQLite 文件。
+	dbPath := filepath.Join(tmpDir, "main-chat-v30.db")
+	// rawDB 在调用 Open 前控制 Goose 只执行已发布的 main 迁移。
+	rawDB, openErr := sql.Open("sqlite", sqliteDSN(dbPath))
+	if openErr != nil {
+		t.Fatalf("open legacy database: %v", openErr)
+	}
+	defer rawDB.Close()
+
+	// dialectErr 保存 Goose SQLite 方言设置失败，失败时不能构造已发布迁移基线。
+	if dialectErr := goose.SetDialect("sqlite3"); dialectErr != nil {
+		t.Fatalf("set goose dialect: %v", dialectErr)
+	}
+	goose.SetBaseFS(migrationsFS)
+	// upErr 将数据库推进到已发布 main 的 00030，验证之后的 dev 迁移连续接续。
+	upErr := goose.UpTo(rawDB, "migrations/sqlite", 30)
+	if upErr != nil {
+		t.Fatalf("apply released main migrations: %v", upErr)
+	}
+
+	// ctx 提供迁移 API 所需的调用上下文；升级本身不依赖请求生命周期。
+	ctx := context.Background()
+	// migrateErr 保存从 main 00030 接续 dev 00031 至 00036 时的迁移失败。
+	if migrateErr := Migrate(ctx, rawDB, DialectSQLite); migrateErr != nil {
+		t.Fatalf("upgrade from main 00030: %v", migrateErr)
+	}
+	if !tableExists(t, rawDB, "order_reconciliations") {
+		t.Fatal("order_reconciliations should be created by the dev schema baseline migration")
+	}
+	if !columnExists(t, rawDB, "chat_messages", "read_status") || !columnExists(t, rawDB, "chat_messages", "read_at") || !columnExists(t, rawDB, "chat_messages", "media_duration") || !columnExists(t, rawDB, "chat_sessions", "item_image_url") {
+		t.Fatal("chat read tracking and media presentation columns should remain after dev schema baseline upgrade")
+	}
+	if !tableExists(t, rawDB, "chat_quick_replies") || !tableExists(t, rawDB, "chat_buyer_notes") {
+		t.Fatal("chat quick reply and buyer note tables should be created by the latest migration")
+	}
+	// finalVersion 验证迁移账本已推进到包含 API 发货策略的最新 dev schema 版本。
+	finalVersion, versionErr := goose.GetDBVersion(rawDB)
+	if versionErr != nil {
+		t.Fatalf("read final migration version: %v", versionErr)
+	}
+	if finalVersion != 37 {
+		t.Fatalf("final migration version=%d, want 37", finalVersion)
+	}
+}
+
+// columnExists 封装columnExists业务协调。
 func columnExists(t *testing.T, db *sql.DB, table, col string) bool {
 	t.Helper()
+	// rows、err 用于本次流程后续判断的rows、err
 	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
 	if err != nil {
 		t.Fatalf("pragma_table_info(%s): %v", table, err)
 	}
 	defer rows.Close()
 	for rows.Next() {
+		// name 用于本次流程后续判断的名称
 		var name string
-		if err := rows.Scan(&name); err != nil {
+		if // err 用于本次流程后续判断的err
+		err := rows.Scan(&name); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
 		if name == col {
@@ -114,25 +179,41 @@ func columnExists(t *testing.T, db *sql.DB, table, col string) bool {
 	return false
 }
 
+// TestLatestMigrationsDownUpSQLite 封装TestLatestMigrationsDownUpSQLite业务协调。
 func TestLatestMigrationsDownUpSQLite(t *testing.T) {
+	// tmp 用于本次流程后续判断的tmp
 	tmp := t.TempDir()
+	// dbPath 用于本次流程后续判断的db路径
 	dbPath := filepath.Join(tmp, "rollback.db")
+	// ctx 用于本次流程后续判断的ctx
 	ctx := context.Background()
+	// d、err 用于本次流程后续判断的d、err
 	d, _, err := Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer d.Close()
 
-	if err := goose.SetDialect("sqlite3"); err != nil {
+	if // err 用于本次流程后续判断的err
+	err := goose.SetDialect("sqlite3"); err != nil {
 		t.Fatalf("goose dialect: %v", err)
 	}
 	goose.SetBaseFS(migrationsFS)
-	// 依次回滚最新版本到 13，再整体升级。00029/00030 是聊天已读
-	// 状态迁移，因此需要额外回滚两次才能到达原有的 migration 14 检查点。
-	for i := 0; i < 17; i++ {
-		if err := goose.Down(d, "migrations/sqlite"); err != nil {
+	// 读取当前最新迁移版本，动态回滚到 13，避免新增迁移后固定次数失效。
+	// version、err 保存当前迁移版本及读取错误。
+	version, err := goose.GetDBVersion(d)
+	if err != nil {
+		t.Fatalf("get migration version: %v", err)
+	}
+	// i 表示本次回滚操作序号。
+	for i := 0; version >= 14; i++ {
+		if // err 保存当前迁移回滚错误，任一方言步骤失败即终止验证。
+		err := goose.Down(d, "migrations/sqlite"); err != nil {
 			t.Fatalf("down migration #%d: %v", i+1, err)
+		}
+		version, err = goose.GetDBVersion(d)
+		if err != nil {
+			t.Fatalf("get migration version after down: %v", err)
 		}
 	}
 	if columnExists(t, d, "notification_channels", "event_types") {
@@ -159,15 +240,18 @@ func TestLatestMigrationsDownUpSQLite(t *testing.T) {
 	if columnExists(t, d, "item_publish_batches", "location_json") {
 		t.Fatal("item_publish_batches.location_json should be removed after migration 28 down")
 	}
+	// table 表示当前遍历过程中的table
 	for _, table := range []string{"account_task_settings", "account_task_runs", "chat_sessions", "chat_messages"} {
 		if tableExists(t, d, table) {
 			t.Fatalf("table should be removed after migration 24 down: %s", table)
 		}
 	}
 
-	if err := goose.Up(d, "migrations/sqlite"); err != nil {
+	if // err 用于本次流程后续判断的err
+	err := goose.Up(d, "migrations/sqlite"); err != nil {
 		t.Fatalf("up after down: %v", err)
 	}
+	// c 表示当前遍历过程中的c
 	for _, c := range []struct {
 		table string
 		col   string
@@ -186,21 +270,31 @@ func TestLatestMigrationsDownUpSQLite(t *testing.T) {
 		{"account_task_settings", "auto_rate_enabled"},
 		{"account_task_runs", "run_key"},
 		{"chat_sessions", "unread_count"},
+		{"chat_sessions", "item_image_url"},
 		{"chat_messages", "message_key"},
+		{"chat_messages", "read_status"},
+		{"chat_messages", "read_at"},
+		{"chat_messages", "media_duration"},
+		{"notification_outbox", "uncertain_at"},
 	} {
 		if !columnExists(t, d, c.table, c.col) {
 			t.Fatalf("column missing after re-up: %s.%s", c.table, c.col)
 		}
 	}
+	// val 用于本次流程后续判断的val
 	var val string
-	if err := d.QueryRow(`SELECT value FROM system_settings WHERE key='renewal_log_retention_days'`).Scan(&val); err != nil || val != "10" {
+	if // err 用于本次流程后续判断的err
+	err := d.QueryRow(`SELECT value FROM system_settings WHERE key='renewal_log_retention_days'`).Scan(&val); err != nil || val != "10" {
 		t.Fatalf("renewal_log_retention_days after re-up: val=%q err=%v", val, err)
 	}
 }
 
+// tableExists 封装tableExists业务协调。
 func tableExists(t *testing.T, db *sql.DB, table string) bool {
 	t.Helper()
+	// name 用于本次流程后续判断的名称
 	var name string
+	// err 用于本次流程后续判断的err
 	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
 	if err != nil {
 		return false

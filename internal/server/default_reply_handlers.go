@@ -1,12 +1,13 @@
 package server
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 
+	defaultreplyapp "xianyu-go/internal/application/defaultreply"
 	"xianyu-go/internal/auth"
-	"xianyu-go/internal/db"
 )
 
 // btoi bool→int（SQLite 无原生 bool）。
@@ -38,140 +39,186 @@ func (s *Server) mountDefaultRepliesReal(r chi.Router) {
 	r.Post("/api/default-reply/{cid}/clear-records", s.clearDefaultReplyRecords)
 }
 
+// getDefaultReply 封装getDefault回复业务协调。
 func (s *Server) getDefaultReply(w http.ResponseWriter, r *http.Request) {
+	// cid 是路径中的默认回复所属账号标识。
 	cid := chi.URLParam(r, "cid")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	// userID 表示认证会话中的当前用户，缺失会话时请求不具备业务身份。
+	userID, ok := defaultReplyUserID(w, r)
+	if !ok {
 		return
 	}
-	dr, err := s.Store.DefaultReps.Get(r.Context(), cid)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "reply_content": "", "reply_once": false})
+	// reply、err 保存应用服务返回的默认回复模型及读取错误。
+	reply, err := s.defaultReplyApplication().Get(r.Context(), userID, cid)
+	switch {
+	case errors.Is(err, defaultreplyapp.ErrConfigNotFound):
+		writeJSON(w, http.StatusOK, defaultReplyResponse{Enabled: false, ReplyContent: "", ReplyOnce: false})
+		return
+	case errors.Is(err, defaultreplyapp.ErrAccountNotFound):
+		writeErr(w, http.StatusNotFound, "账号不存在")
+		return
+	case errors.Is(err, defaultreplyapp.ErrForbidden):
+		writeErr(w, http.StatusForbidden, "无权限操作该账号")
+		return
+	case err != nil:
+		writeErr(w, http.StatusInternalServerError, "查询失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled": dr.Enabled, "reply_content": dr.ReplyContent,
-		"reply_image_url": dr.ReplyImageURL, "reply_once": dr.ReplyOnce,
-	})
+	// 已保存默认回复通过具名 DTO 返回，单账号查询不填充 cookie_id。
+	writeJSON(w, http.StatusOK, newDefaultReplyResponse("", reply))
 }
 
+// setDefaultReply 保存指定账号的默认回复配置。
 func (s *Server) setDefaultReply(w http.ResponseWriter, r *http.Request) {
+	// cid 是当前操作的账号标识。
 	cid := chi.URLParam(r, "cid")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	// userID 表示认证会话中的当前用户，缺失会话时请求不具备业务身份。
+	userID, ok := defaultReplyUserID(w, r)
+	if !ok {
 		return
 	}
-	var req struct {
-		Enabled       bool   `json:"enabled"`
-		ReplyContent  string `json:"reply_content"`
-		ReplyImageURL string `json:"reply_image_url"`
-		ReplyOnce     bool   `json:"reply_once"`
-	}
-	if err := decodeJSON(r, &req); err != nil {
+	// req 是默认回复配置请求体。
+	var req defaultReplyMutationRequest
+	// decodeErr 表示请求体不是有效的默认回复 JSON。
+	if decodeErr := decodeJSON(r, &req); decodeErr != nil {
 		writeErr(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	_, err := s.Store.DB.ExecContext(r.Context(),
-		`INSERT INTO default_replies (cookie_id, enabled, reply_content, reply_image_url, reply_once, updated_at)
-		 VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)`+db.DialectUpsert(s.Store.Dialect, []string{"cookie_id"}, map[string]string{
-			"enabled":         "EXCLUDED.enabled",
-			"reply_content":   "EXCLUDED.reply_content",
-			"reply_image_url": "EXCLUDED.reply_image_url",
-			"reply_once":      "EXCLUDED.reply_once",
-			"updated_at":      "CURRENT_TIMESTAMP",
-		}),
-		cid, btoi(req.Enabled), req.ReplyContent, nullIfEmpty(req.ReplyImageURL), btoi(req.ReplyOnce))
+	// err 表示默认回复应用服务写入失败的原因。
+	err := s.defaultReplyApplication().Upsert(r.Context(), userID, cid, defaultreplyapp.Reply{
+		Enabled: req.Enabled, ReplyContent: req.ReplyContent,
+		ReplyImageURL: req.ReplyImageURL, ReplyOnce: req.ReplyOnce,
+	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存失败")
+		writeDefaultReplyMutationError(w, err, "保存失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	writeJSON(w, http.StatusOK, operationResponse{Success: true})
 }
 
+// defaultReplyMutationRequest 是默认回复配置写入接口的具名请求 DTO。
+type defaultReplyMutationRequest struct {
+	// Enabled 表示是否启用默认回复。
+	Enabled bool `json:"enabled"`
+	// ReplyContent 是默认回复文字内容。
+	ReplyContent string `json:"reply_content"`
+	// ReplyImageURL 是默认回复图片地址。
+	ReplyImageURL string `json:"reply_image_url"`
+	// ReplyOnce 表示同一聊天是否只发送一次默认回复。
+	ReplyOnce bool `json:"reply_once"`
+}
+
+// listDefaultReplies 查询当前用户的默认回复列表。
 func (s *Server) listDefaultReplies(w http.ResponseWriter, r *http.Request) {
+	// sess 是当前登录用户会话。
 	sess := auth.SessionFromContext(r.Context())
-	rows, err := s.Store.DB.QueryContext(r.Context(),
-		`SELECT dr.cookie_id, dr.enabled, COALESCE(dr.reply_content,''), dr.reply_once, COALESCE(dr.reply_image_url,'')
-		   FROM default_replies dr
-		   JOIN cookies c ON c.id=dr.cookie_id
-		  WHERE c.user_id=?`, sess.UserID)
+	if sess == nil {
+		writeErr(w, http.StatusUnauthorized, "未授权访问")
+		return
+	}
+	// rows 和 err 是当前用户的应用层默认回复列表及查询错误。
+	rows, err := s.defaultReplyApplication().List(r.Context(), sess.UserID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "查询失败")
 		return
 	}
-	defer rows.Close()
-	var out []map[string]any
-	for rows.Next() {
-		var cid, content, imageURL string
-		var enabled, replyOnce int
-		if err := rows.Scan(&cid, &enabled, &content, &replyOnce, &imageURL); err != nil {
-			continue
-		}
-		out = append(out, map[string]any{
-			"cookie_id": cid, "enabled": enabled != 0, "reply_content": content,
-			"reply_once": replyOnce != 0, "reply_image_url": imageURL,
+	// out 是默认回复列表响应。
+	var out []defaultReplyResponse
+	// row 表示当前遍历过程中的应用层默认回复摘要。
+	for _, row := range rows {
+		out = append(out, defaultReplyResponse{
+			CookieID: row.CookieID, Enabled: row.Reply.Enabled, ReplyContent: row.Reply.ReplyContent,
+			ReplyOnce: row.Reply.ReplyOnce, ReplyImageURL: row.Reply.ReplyImageURL,
+			// 列表 DTO 保留账号标识，前端可直接建立按账号索引。
 		})
 	}
-	if err := rows.Err(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "查询失败")
-		return
-	}
 	writeJSON(w, http.StatusOK, out)
 }
 
+// listDefaultRepliesMap 查询按账号索引的默认回复映射。
 func (s *Server) listDefaultRepliesMap(w http.ResponseWriter, r *http.Request) {
+	// sess 是当前登录用户会话。
 	sess := auth.SessionFromContext(r.Context())
-	rows, err := s.Store.DB.QueryContext(r.Context(),
-		`SELECT dr.cookie_id, dr.enabled, COALESCE(dr.reply_content, ''), dr.reply_once, COALESCE(dr.reply_image_url, '')
-		   FROM default_replies dr
-		   JOIN cookies c ON c.id=dr.cookie_id
-		  WHERE c.user_id=?`, sess.UserID)
+	if sess == nil {
+		writeErr(w, http.StatusUnauthorized, "未授权访问")
+		return
+	}
+	// rows 和 err 是当前用户的应用层默认回复列表及查询错误。
+	rows, err := s.defaultReplyApplication().List(r.Context(), sess.UserID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "查询失败")
 		return
 	}
-	defer rows.Close()
-	out := make(map[string]any)
-	for rows.Next() {
-		var cid, content, imageURL string
-		var enabled, replyOnce int
-		if err := rows.Scan(&cid, &enabled, &content, &replyOnce, &imageURL); err != nil {
-			continue
+	// out 是按账号标识索引的默认回复映射。
+	out := make(map[string]defaultReplyResponse)
+	// row 表示当前遍历过程中的应用层默认回复摘要。
+	for _, row := range rows {
+		out[row.CookieID] = defaultReplyResponse{
+			CookieID:      row.CookieID,
+			Enabled:       row.Reply.Enabled,
+			ReplyContent:  row.Reply.ReplyContent,
+			ReplyOnce:     row.Reply.ReplyOnce,
+			ReplyImageURL: row.Reply.ReplyImageURL,
+			// map 键与 cookie_id 同时保留，兼容旧前端索引方式。
 		}
-		out[cid] = map[string]any{
-			"cookie_id":       cid,
-			"enabled":         enabled != 0,
-			"reply_content":   content,
-			"reply_once":      replyOnce != 0,
-			"reply_image_url": imageURL,
-		}
-	}
-	if err := rows.Err(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "查询失败")
-		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
+// deleteDefaultReply 删除指定账号的默认回复配置。
 func (s *Server) deleteDefaultReply(w http.ResponseWriter, r *http.Request) {
+	// cid 是当前操作的账号标识。
 	cid := chi.URLParam(r, "cid")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	// userID 表示认证会话中的当前用户，缺失会话时请求不具备业务身份。
+	userID, ok := defaultReplyUserID(w, r)
+	if !ok {
 		return
 	}
-	_, err := s.Store.DB.ExecContext(r.Context(), `DELETE FROM default_replies WHERE cookie_id=?`, cid)
+	// err 表示默认回复应用服务删除失败的原因。
+	err := s.defaultReplyApplication().Delete(r.Context(), userID, cid)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "删除失败")
+		writeDefaultReplyMutationError(w, err, "删除失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	writeJSON(w, http.StatusOK, operationResponse{Success: true})
 }
 
+// clearDefaultReplyRecords 清空指定账号的默认回复发送记录。
 func (s *Server) clearDefaultReplyRecords(w http.ResponseWriter, r *http.Request) {
+	// cid 是当前操作的账号标识。
 	cid := chi.URLParam(r, "cid")
-	if _, ok := s.requireCookieOwner(w, r, cid); !ok {
+	// userID 表示认证会话中的当前用户，缺失会话时请求不具备业务身份。
+	userID, ok := defaultReplyUserID(w, r)
+	if !ok {
 		return
 	}
-	if _, err := s.Store.DB.ExecContext(r.Context(), `DELETE FROM default_reply_records WHERE cookie_id=?`, cid); err != nil {
-		writeErr(w, http.StatusInternalServerError, "清空失败")
+	// err 表示默认回复应用服务清理投递记录失败的原因。
+	if err := s.defaultReplyApplication().ClearRecords(r.Context(), userID, cid); err != nil {
+		writeDefaultReplyMutationError(w, err, "清空失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+	writeJSON(w, http.StatusOK, operationResponse{Success: true})
+}
+
+// defaultReplyUserID 从认证上下文读取当前用户，并统一处理缺失会话。
+func defaultReplyUserID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	// session 是认证中间件写入请求上下文的当前用户会话。
+	session := auth.SessionFromContext(r.Context())
+	if session == nil {
+		writeErr(w, http.StatusUnauthorized, "未授权访问")
+		return 0, false
+	}
+	return session.UserID, true
+}
+
+// writeDefaultReplyMutationError 将默认回复应用错误映射为既有 HTTP 错误语义。
+func writeDefaultReplyMutationError(w http.ResponseWriter, err error, fallback string) {
+	switch {
+	case errors.Is(err, defaultreplyapp.ErrAccountNotFound):
+		writeErr(w, http.StatusNotFound, "账号不存在")
+	case errors.Is(err, defaultreplyapp.ErrForbidden):
+		writeErr(w, http.StatusForbidden, "无权限操作该账号")
+	default:
+		writeErr(w, http.StatusInternalServerError, fallback)
+	}
 }
